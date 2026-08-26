@@ -1,0 +1,24 @@
+# Environment variables / secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Node
+node_modules/
+build/
+dist/
+
+# Database
+*.db
+*.sqlite3
+
+# FAISS index files
+*.index
+
+# OS
+.DS_Store
