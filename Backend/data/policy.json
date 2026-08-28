@@ -1,0 +1,35 @@
+{
+  "policy_version": "1.0",
+  "spend_limits": {
+    "max_spend_per_transaction": 20000,
+    "max_upsell_addon_percentage": 25,
+    "daily_agent_spend_cap": 50000
+  },
+  "category_restrictions": {
+    "blocked_categories": [],
+    "restricted_categories": {
+      "electronics": {
+        "max_single_item_price": 60000
+      }
+    }
+  },
+  "approval_gate": {
+    "approval_required_above": 10000,
+    "auto_approve_below": 10000,
+    "approval_timeout_seconds": 300
+  },
+  "upsell_rules": {
+    "enabled": true,
+    "max_upsell_items_per_order": 1,
+    "upsell_must_fit_remaining_budget": true
+  },
+  "failure_handling": {
+    "max_retry_attempts": 2,
+    "retry_backoff_seconds": 3,
+    "escalate_after_max_retries": true
+  },
+  "cart_incentives": {
+    "free_delivery_threshold": 1999,
+    "nudge_trigger_max_gap_percentage": 30
+  }
+}

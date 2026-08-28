@@ -67,6 +67,26 @@ def first_image(images_str):
     return None
 
 
+def detect_gender(product_name):
+    """
+    Extracts an implied gender tag from a product name, so complementary-
+    item selection can avoid pairing e.g. a women's watch with a men's
+    shirt. Such mismatches get correctly rejected by the LLM downstream,
+    but that wastes a candidate slot that could have gone to a genuinely
+    usable, same-gender pairing instead.
+    """
+    name_lower = product_name.lower()
+    if re.search(r"\bmen\b", name_lower) and "women" not in name_lower:
+        return "men"
+    if "women" in name_lower:
+        return "women"
+    if re.search(r"\bboys?\b", name_lower):
+        return "boys"
+    if re.search(r"\bgirls?\b", name_lower):
+        return "girls"
+    return "unisex"
+
+
 # Brand/store names that got mistakenly captured as "category" during
 # scraping (breadcrumb depth was inconsistent for these rows) — not real
 # product categories, so they're excluded.
@@ -81,18 +101,14 @@ JUNK_CATEGORIES = {
 }
 
 # Broad category groups used to build sensible complementary-item pairs.
-# Every group here resolves to a NON-EMPTY complement pool in
-# COMPLEMENT_GROUP_RULES below — this matters because if a group's complement
-# list is empty, every product in that group gets zero upsell candidates.
 CATEGORY_GROUP = {
-    "Shirts": "top", "Tshirts": "top", "Tops": "top", "Jackets": "top",
+    "Shirts": "top", "Tshirts": "top", "Tops": "top", "Jackets": "top", "Kurtis": "top",
     "Jeans": "bottom", "Track Pants": "bottom", "Palazzos": "bottom", "Trousers": "bottom",
     "Lounge Pants": "bottom", "Leggings": "bottom", "Shorts": "bottom", "Tights": "bottom",
     "Jeggings": "bottom", "Thermal Bottoms": "bottom",
     "Sarees": "ethnic", "Kurtas": "ethnic", "Kurta Sets": "ethnic", "Sherwani": "ethnic",
     "Saree Blouse": "ethnic", "Lehenga Choli": "ethnic", "Ethnic Dresses": "ethnic",
-    "Shawl": "ethnic", "Scarves": "ethnic", "Dress Material": "ethnic", "Kurtis": "ethnic",
-    "Clothing Set": "ethnic",
+    "Shawl": "ethnic", "Scarves": "ethnic", "Dress Material": "ethnic", "Clothing Set": "ethnic",
     "Watches": "accessory", "Wallets": "accessory", "Watch Gift Set": "accessory",
     "Earrings": "accessory", "Travel Accessory": "accessory", "Trolley Bag": "accessory",
     "Laptop Bag": "accessory",
@@ -105,21 +121,23 @@ CATEGORY_GROUP = {
     "Teether": "baby",
 }
 
-# Which groups can complement which other groups. 'accessory' now pairs with
-# 'top'/'bottom' (a watch or wallet suggested alongside a shirt/jeans) —
-# previously this was empty, which meant ~26% of the catalog (mostly
-# Watches + Wallets, the two largest categories) never had an upsell
-# candidate at all.
+# Which groups can complement which other groups. Expanded so a full
+# "head-to-toe" outfit (top + bottom + footwear + accessory) is possible
+# for garment categories, and so accessories/footwear can also suggest a
+# complete outfit around themselves — consistent 3-group mapping wherever
+# it makes sense. "dress" is an intentional exception: a dress is already
+# a complete top+bottom garment, so pairing it with another top/bottom
+# doesn't make sense — it only gets accessory + footwear.
 COMPLEMENT_GROUP_RULES = {
-    "top": ["accessory", "bottom"],
-    "bottom": ["accessory", "top"],
-    "ethnic": ["accessory"],
-    "accessory": ["top", "bottom"],
-    "footwear": ["bottom"],
-    "dress": ["accessory", "footwear"],
+    "top": ["bottom", "footwear", "accessory"],
+    "bottom": ["top", "footwear", "accessory"],
+    "ethnic": ["bottom", "accessory", "footwear"],
+    "accessory": ["top", "bottom", "footwear"],
+    "footwear": ["top", "bottom", "accessory"],
+    "dress": ["accessory", "footwear"],  # intentional 2-group exception, see comment above
     "innerwear": ["top"],
     "personalcare": ["personalcare"],
-    "baby": [],  # genuinely has no sensible fashion pairing — left empty on purpose
+    "baby": [],
     "misc": [],
 }
 
@@ -142,16 +160,18 @@ def build_catalog():
     products = []
     for i, row in df.iterrows():
         pid = f"M{i + 1:04d}"
+        name = clean_text(f"{row['title']} {row['product_description']}", 80)
         raw_rating = float(row["rating"]) if pd.notna(row["rating"]) else 0.0
         products.append({
             "id": pid,
-            "name": clean_text(f"{row['title']} {row['product_description']}", 80),
+            "name": name,
             "category": row["sub_category"],
             "price": int(row["price_clean"]),
             "rating": raw_rating,
             "description": clean_text(row["product_description"], 200),
             "image_url": first_image(row["images"]),
             "_group": CATEGORY_GROUP.get(row["sub_category"], "misc"),
+            "_gender": detect_gender(name),
         })
 
     # Fix zero/missing ratings -> assign a realistic value instead of 0.0,
@@ -171,7 +191,18 @@ def build_catalog():
     for idx in out_indices:
         products[idx]["stock"] = 0
 
-    # Build complementary-item mapping via category groups.
+        # Build complementary-item mapping via category groups, preferring
+    # candidates that share the main product's gender (or are unisex) so
+    # the buyer agent isn't handed nonsensical gender-mismatched hints.
+    #
+    # We pick up to CANDIDATES_PER_GROUP items from EACH complement-group
+    # (not just 1) so the buyer agent's reasoning step has real
+    # alternatives to choose from within each outfit "slot" — e.g. if one
+    # randomly-picked footwear candidate happens to be a style mismatch,
+    # there are 2 more footwear options to consider instead of none.
+    CANDIDATES_PER_GROUP = 3
+
+    products_by_id = {p["id"]: p for p in products}
     by_group = {}
     for p in products:
         by_group.setdefault(p["_group"], []).append(p["id"])
@@ -180,14 +211,34 @@ def build_catalog():
         comp_groups = COMPLEMENT_GROUP_RULES.get(p["_group"], [])
         comp_ids = []
         for cg in comp_groups:
-            candidates = [pid for pid in by_group.get(cg, []) if pid != p["id"]]
-            if candidates:
-                comp_ids.append(random.choice(candidates))
-        p["complementary_items"] = comp_ids[:2]
+            pool = [pid for pid in by_group.get(cg, []) if pid != p["id"]]
+            if not pool:
+                continue
+
+            if p["_gender"] == "unisex":
+                chosen_pool = pool
+            else:
+                same_gender_pool = [
+                    pid for pid in pool
+                    if products_by_id[pid]["_gender"] in (p["_gender"], "unisex")
+                ]
+                chosen_pool = same_gender_pool if same_gender_pool else pool
+
+            # Pick up to CANDIDATES_PER_GROUP unique candidates from this group.
+            n_pick = min(CANDIDATES_PER_GROUP, len(chosen_pool))
+            comp_ids.extend(random.sample(chosen_pool, n_pick))
+
+        p["complementary_items"] = comp_ids
+
+    # Clean up temporary fields ONLY after every product has finished
+    # computing its complementary_items — deleting them earlier (inside
+    # the loop above) breaks later iterations that still need to look up
+    # an EARLIER product's _gender/_group as a candidate.
+    for p in products:
         del p["_group"]
+        del p["_gender"]
 
     return products
-
 
 def validate(products):
     all_ids = {p["id"] for p in products}
