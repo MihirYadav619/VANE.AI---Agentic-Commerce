@@ -13,14 +13,17 @@ bounded, gated, and audited.
 - [x] **Hybrid retrieval** (semantic + keyword search) so the agent can find relevant products
 - [x] **AI buyer agent** that understands intent, searches the catalog, and
       selects a product with explainable, honest reasoning
-- [ ] **Purchase execution end-to-end** — no human clicking "buy" (Phase 5)
+- [x] **Purchase execution end-to-end** — no human clicking "buy" for the
+      actual transaction (Razorpay Orders API integrated; payment collection
+      goes through Razorpay Checkout, verified server-side)
 - [x] **Multiple revenue-growth mechanisms** — the agent also grows revenue
       within a transaction (the "grow the merchant's revenue" half of the PS)
-- [ ] **Policy/guardrail engine** — every money action stays bounded
-      (spend caps, category limits) (Phase 4)
-- [ ] **Approval gate** — high-value or policy-violating orders pause for
-      approval instead of executing blindly (Phase 4)
-- [ ] **Real Razorpay test-mode integration** — Orders + Payments API (Phase 5)
+- [x] **Policy/guardrail engine** — every money action stays bounded
+      (customer-stated budgets, merchant-side spend caps)
+- [x] **Approval gate** — high-value or policy-violating orders pause for
+      approval instead of executing blindly
+- [x] **Real Razorpay test-mode integration** — Orders API + Checkout +
+      signature verification, fully tested end-to-end
 - [ ] **Audit trail** — every decision, reasoning, and transaction is logged
       and viewable in a dashboard (Phase 7)
 - [ ] **At least one graceful failure** — a deliberate failure scenario that
@@ -33,10 +36,9 @@ bounded, gated, and audited.
    purchase = positive reward).
 2. **Multiple failure scenarios (5, not just 1)** — payment timeout,
    stock-out (simulated as a race-condition at payment time, not a
-   search-time filter — see Catalog Source below), policy violation,
-   API rate-limit, and **prompt-injection resistance** (a deliberately
-   malicious/crafted product description attempting to manipulate the
-   agent's reasoning — see Known Limitations below for why this matters).
+   search-time filter), policy violation, API rate-limit, and
+   **prompt-injection resistance** (a deliberately malicious/crafted product
+   description attempting to manipulate the agent's reasoning).
 3. **Measured retrieval quality** — quantify hybrid search (FAISS + BM25 +
    RRF) vs. keyword-only search with a simple metric, backed by a number
    instead of just a demo.
@@ -47,11 +49,9 @@ bounded, gated, and audited.
    proper charts for revenue/approval/failure-recovery stats, mobile
    responsiveness.
 
-**Checkpoint rule:** after Phase 5 (Razorpay integration) is done, honestly
-assess progress against the timeline. If on schedule, continue through the
-additional goals above. If behind, drop items in the order listed (UI
-polish first, bandit algorithm last, since the bandit is the highest-value
-differentiator).
+**Checkpoint (completed after Phase 5):** Progress assessed as comfortably
+on-time. Proceeding with the full additional-goals list above as originally
+planned, in the order listed.
 
 ---
 
@@ -64,98 +64,122 @@ differentiator).
 - Real product catalog built from a public Myntra dataset (see *Catalog
   Source* below) — **897 products** across 53 categories, fully validated
 - Policy schema defined: spend caps, approval-gate threshold, upsell rules
-- `.env.example`, `.gitignore`, `requirements.txt` set up
-- Reproducible via `backend/scripts/generate_catalog.py` — anyone can
-  regenerate the exact same catalog from scratch with one command
+- Reproducible via `backend/scripts/generate_catalog.py`
 
 ### Phase 2 — Hybrid Retrieval ✅
-- **FAISS semantic search** (`catalog-service/build_embeddings.py`) — every
-  product embedded with `all-MiniLM-L6-v2`, indexed for meaning-based search
-- **BM25 keyword search** (`catalog-service/bm25_search.py`) — exact-text
-  matching, complements FAISS's semantic strength
-- **Price-constraint parser** (`catalog-service/query_parser.py`) — extracts
-  phrases like "under 5000" from queries *before* they hit search, applying
-  them as a hard numeric filter instead of leaving them as keywords. This
-  fixed a real bug where "watch under 5000" matched the brand "UNDER ARMOUR"
-  ahead of actual watches.
-- **Hybrid search** (`catalog-service/hybrid_search.py`) — combines FAISS +
-  BM25 using **Reciprocal Rank Fusion (RRF)**, not simple score-averaging.
-  RRF was adopted after testing showed min-max normalization let a weak
-  keyword match tie with a genuinely strong semantic match (both scoring
-  "1.0" as each method's #1 result).
-- Out-of-stock items are filtered out of search results entirely — a
-  deliberate design choice (see Catalog Source below for how the
-  failure-demo scenario is handled instead)
-- **Known catalog-coverage limitation**: some categories (e.g. "Jackets")
-  have very few products, so a specific query (e.g. "blue denim jacket")
-  may return the closest available alternative rather than an exact match.
-  This reflects genuine catalog scarcity, not a search bug — judging
-  *whether* a candidate is a true match is intentionally left to the buyer
-  agent's reasoning (Phase 3), not the search layer.
+- **FAISS semantic search**, **BM25 keyword search**, and a **price-constraint
+  parser** (fixed a real bug where "watch under 5000" matched the brand
+  "UNDER ARMOUR" ahead of actual watches)
+- **Hybrid search** combines FAISS + BM25 using **Reciprocal Rank Fusion
+  (RRF)**, adopted after testing showed min-max normalization let a weak
+  keyword match tie with a genuinely strong semantic match
+- Out-of-stock items are filtered out of search entirely — the failure-demo
+  (Phase 9) instead simulates a realistic race-condition at payment time
+- **Known catalog-coverage limitation**: some categories have very few
+  products, so specific queries may return the closest available
+  alternative — judging *whether* a candidate is a true match is
+  intentionally left to the buyer agent's reasoning, not the search layer
 
 ### Phase 3 — Buyer Agent Core Reasoning + Revenue Mechanisms ✅
-- **Core reasoning engine** (`buyer-agent/reasoning_engine.py`, using
-  Mistral AI `mistral-small-2603`) — takes a natural-language request,
-  retrieves candidates via hybrid search, and uses LLM tool-calling to
-  select the best genuine match. Explicitly distinguishes **hard
-  constraints** (category, color, price — reject on mismatch) from **soft
-  preferences** (comfort, style — don't reject just because unconfirmed).
-  Honestly reports "no match found" rather than forcing a bad pick.
-- Four distinct, tested revenue-growth mechanisms were built (not just one
-  generic "upsell"):
+- **Core reasoning engine** (`buyer-agent/reasoning_engine.py`, Mistral AI
+  `mistral-small-2603`) — retrieves candidates via hybrid search, uses LLM
+  tool-calling to select the best genuine match. Distinguishes **hard
+  constraints** (reject on mismatch) from **soft preferences** (don't reject
+  just because unconfirmed). Honestly reports "no match found" rather than
+  forcing a bad pick.
+- Four distinct, tested revenue-growth mechanisms:
+  1. **True Upsell** (`upsell_true.py`) — same-category, higher-priced,
+     meaningfully-better alternative. *Replaces* the chosen item rather
+     than adding a new one.
+  2. **Complete the Look** (`complete_the_look.py`) — complementary,
+     different-category items, using the catalog's `complementary_items`
+     field as a candidate hint (not a final answer). Enforces **one
+     suggestion per "outfit slot"**, and ranks suggestions by
+     **priority_rank** (1 = most valuable) so budget-constrained scenarios
+     keep the most important item first rather than an arbitrary one.
+  3. **Similar Items** (`similar_items.py`) — other same-category
+     alternatives at a comparable price, for browsing/variety. **Only used
+     in Human-Browse mode** (see Purchase Architecture) — never
+     auto-purchased in Fully-Autonomous mode, to avoid e.g. buying two
+     t-shirts when the customer asked for one.
+  4. **Cart-Value Threshold Nudge** (`cart_nudge.py`) — pure-arithmetic
+     (no LLM) incentive message, e.g. "Add ₹150 more to unlock free
+     delivery," using a configurable threshold from `policy.json`.
+- **Catalog fixes made during testing:** expanded complementary-item
+  candidates (1→3 per outfit-slot), added gender-aware selection (fixed
+  many LLM rejections caused by nonsensical gender-mismatched hints), and
+  reassigned synthetic ratings for 147 products that had no rating in the
+  raw dataset (disclosed for transparency — not real customer data).
 
-  1. **True Upsell** (`buyer-agent/upsell_true.py`) — suggests a
-     same-category, higher-priced, meaningfully-better alternative (e.g. a
-     higher-rated shirt). Distinct from cross-sell: it *replaces* the
-     chosen item, it doesn't add a new one. Bounded by the customer's own
-     stated price ceiling (see Purchase Architecture below), not a
-     separate budget.
-  2. **Complete the Look** (`buyer-agent/complete_the_look.py`) — suggests
-     complementary, different-category items (e.g. a shirt + trousers +
-     watch) using the catalog's `complementary_items` field as a
-     **candidate hint**, not a final answer — the agent independently
-     judges relevance, style-consistency, and gender-appropriateness.
-     Enforces **one suggestion per "outfit slot"** (topwear, footwear,
-     accessory, etc.) so it never suggests 3 competing tops at once — a
-     real bug caught during testing when candidate counts were increased.
-  3. **Similar Items** (`buyer-agent/similar_items.py`) — shows other
-     same-category alternatives at a comparable price (e.g. other t-shirts
-     in different colors), for browsing/variety. **Only used in
-     Human-Browse mode** (see Purchase Architecture) — never
-     auto-purchased in Fully-Autonomous mode, since that could otherwise
-     result in buying two t-shirts when the customer asked for one.
-  4. **Cart-Value Threshold Nudge** (`buyer-agent/cart_nudge.py`) — a
-     pure-arithmetic (no LLM) incentive message, e.g. "Add ₹150 more to
-     unlock free delivery," using a configurable threshold from
-     `policy.json`. Deliberately skips the nudge if the cart is too far
-     from the threshold (>30% gap) to avoid feeling like a fake push.
+### Phase 4 — Policy Engine + Purchase Architecture ✅
+- **`buyer-agent/policy_engine.py`** ties product-selection and all revenue
+  modules into one coherent, bounded, auditable order-building flow
+- **Two purchase modes**, resolving a real risk discovered during design
+  (an agent autonomously adding items the customer never actually wanted):
+  - **Fully-Autonomous mode**: the customer states a request and,
+    optionally, opts into "Complete the Look" with a *separate* add-ons
+    budget. True Upsell is bounded by the customer's own stated primary
+    price ceiling (it's a *replacement*, not an addition, so needs no
+    separate consent). Complete the Look is bounded by the opt-in add-ons
+    budget. **Similar Items is not used here** — there's no human to
+    choose between duplicate-risk alternatives.
+  - **Human-Browse mode**: the agent surfaces all options (upsell,
+    complete-the-look, similar items) for the human to choose from,
+    without auto-applying any of them — no upfront budget needed here,
+    since the human sees real prices and self-regulates. Once selected,
+    the agent executes payment autonomously — same as the other mode.
+  - **The common thread**: regardless of who chooses *what* to buy, the
+    agent always handles *how* it gets bought (search, policy checks, the
+    actual Razorpay transaction) — never a manual, human-clicked step.
+- **Priority-ranked budget allocation**: when a customer's addons-budget
+  can't fit every suggested item, the engine keeps items in the LLM's own
+  priority order (not an arbitrary list-order) — verified via testing
+  that showed the previous list-order approach was essentially
+  coincidental, tied to slot-processing order rather than genuine
+  importance.
+- **Code-level safety nets throughout**: every module's LLM decision is
+  re-verified in code (price, stock, budget, valid IDs) before being
+  trusted — since testing surfaced real cases of LLM arithmetic mistakes
+  (e.g. incorrectly concluding a ₹2,796 item exceeded a ₹5,000 budget).
 
-- **Catalog fixes made during Phase 3 testing:**
-  - Complementary-item mapping was originally too sparse (only 1 candidate
-    per outfit-slot, capped at 2 total) — expanded to 3 candidates per
-    slot and 3 slots per category (up to ~9 raw hints), which raised the
-    genuine-suggestion rate from 64% to 100% in testing.
-  - Complementary candidates were originally picked at random regardless
-    of gender, causing many LLM rejections (e.g. a women's watch offered
-    for a men's shirt). Fixed by adding gender-detection
-    (`detect_gender()` in `generate_catalog.py`) and preferring
-    same-gender candidates during catalog generation.
-  - 147 products had a `0.0` rating in the raw dataset (meaning "no
-    reviews yet") — reassigned a synthetic realistic rating (3.5–4.8) so
-    demos never show an unrealistic 0-star recommendation. **Disclosed
-    here for transparency — these specific values are not real customer
-    data.**
+### Phase 5 — Razorpay Integration ✅
+- **`buyer-agent/razorpay_client.py`** — creates orders (`create_order()`),
+  verifies payment signatures (`verify_payment_signature()`), and can
+  capture/fetch payments.
+- **Important correction made during development**: initially assumed
+  Razorpay's server-side SDK could create a card payment directly with raw
+  card numbers. This is incorrect — for PCI-DSS compliance, actual payment
+  collection must go through Razorpay's Checkout UI (browser-based), even
+  in test mode. The server side only creates orders and verifies/captures
+  payments; a minimal standalone `test_checkout.html` (temporary — not the
+  Phase 10 frontend) was built to complete test payments via Checkout.js
+  ahead of the real frontend being built.
+- **Correct test card discovered via Razorpay's official docs** (an
+  earlier generic Visa test number triggered an "international cards not
+  supported" error on an India test account): domestic Indian test card is
+  **4100 2800 0000 1007** (any CVV, any future expiry, any 4+ digit OTP for
+  success, <4 digits for a deliberate failure — useful for Phase 9).
+- **Full loop verified end-to-end**: order created → real test payment
+  completed via Checkout → signature verified server-side (`True`).
+- **`policy_engine.py` now creates a real Razorpay order automatically**
+  whenever a `build_order()` call resolves to `auto_approved` — the
+  order's `notes` field carries the agent's `item_ids` and
+  `reasoning_summary`, confirmed visible directly in the Razorpay
+  dashboard. `pending_approval` and Browse-mode results deliberately do
+  **not** create a Razorpay order yet — creating a real payable order
+  before a human/merchant has approved it would defeat the point of the
+  gate.
 
 ---
 
 ## Purchase Architecture: Two Modes
 
-A key design decision made during Phase 3 testing: letting the agent
+A key design decision made during Phase 3/4 testing: letting the agent
 autonomously ADD extra items (cross-sell/similar-items) without any human
 checkpoint risks charging a customer for something they never actually
-wanted (e.g. two t-shirts when they asked for one). The fix is to
-separate **who selects items** from **who executes payment** — the latter
-is *always* the agent, in both modes below, preserving the PS's "no human
+wanted (e.g. two t-shirts when they asked for one). The fix separates
+**who selects items** from **who executes payment** — the latter is
+*always* the agent, in both modes below, preserving the PS's "no human
 clicking buy" requirement for the actual transaction itself.
 
 ### Mode 1: Fully Autonomous
@@ -164,25 +188,22 @@ optionally, opts into "Complete the Look" with a separate add-ons budget
 (e.g. "up to ₹500 more"). The agent then runs end-to-end with no further
 human input:
 - **True Upsell** operates only within the customer's own stated primary
-  budget (e.g. never suggests a shirt over ₹1000, even if a "better" one
-  exists slightly above it) — this is a *replacement*, not an addition,
-  so it doesn't need separate consent beyond the price ceiling the
-  customer already gave.
+  budget — a *replacement*, not an addition, so it doesn't need separate
+  consent beyond the price ceiling the customer already gave.
 - **Complete the Look** operates only within the separately-stated,
-  opt-in add-ons budget — this *does* require the upfront opt-in, since
-  it adds new items to the order.
-- **Similar Items is not used in this mode** — since there's no human to
-  choose between alternatives, auto-adding one would risk duplicate
-  purchases (e.g. two t-shirts).
-- The agent completes the purchase (Phase 5: Razorpay) with no further
-  confirmation, subject to the policy engine's approval-gate (Phase 4)
-  for high-value orders.
+  opt-in add-ons budget, keeping the highest-priority items first if the
+  budget can't fit everything the LLM suggested.
+- **Similar Items is not used in this mode** — no human to choose between
+  alternatives, so auto-adding one risks duplicate purchases.
+- The agent creates the Razorpay order automatically if `auto_approved`;
+  a high-value total instead sets `pending_approval` and no order is
+  created until that's resolved.
 
 ### Mode 2: Human-Browse, Agent-Executes
 The agent still searches and runs all four revenue mechanisms, but
 presents them as **options for the human to choose from**, rather than
-auto-applying any of them. No upfront budget question is needed here —
-the human sees real prices and self-regulates naturally. Once the human
+auto-applying any of them. No upfront budget question is needed — the
+human sees real prices and self-regulates naturally. Once the human
 finalizes their selection (which may legitimately include, say, two
 t-shirts if they consciously pick both), the agent takes over and
 executes the payment autonomously — same policy/gate/audit pipeline as
@@ -192,9 +213,6 @@ Mode 1.
 to buy, the agent always handles *how* it gets bought — search, policy
 checks, and the actual Razorpay transaction are never a manual, human-
 clicked step.
-
-*(This architecture will be implemented in Phase 4 (consent/budget schema)
-and surfaced in Phase 10 (frontend mode-selection UI).)*
 
 ---
 
@@ -206,44 +224,41 @@ scope vs. what would need more work in a production system:
 
 - **Authorization is a stored flag, not a cryptographic mandate.** Real
   protocols like AP2 use signed mandates to *prove* a payment was
-  customer-authorized. Our consent/budget model (see Purchase Architecture
-  above) captures the same *intent* but stores it as a simple record, not
-  a cryptographically-verifiable proof. Acceptable for this scope; would
-  need real signing infrastructure in production.
-- **Merchant-policy vs. customer-budget are now separated**, after
-  initially being conflated. `policy.json`'s spend-caps/approval-gate are
+  customer-authorized. Our consent/budget model captures the same
+  *intent* but stores it as a simple record, not a cryptographically-
+  verifiable proof.
+- **Merchant-policy vs. customer-budget are separated**, after initially
+  being conflated. `policy.json`'s spend-caps/approval-gate are
   *merchant-side* governance bounds; the customer's own stated budget
   (primary item price ceiling + optional add-ons budget) is a *separate*,
   per-purchase authorization layer.
 - **Prompt-injection resistance is partially built, not yet explicitly
-  tested.** A malicious/crafted product description could theoretically
-  attempt to manipulate the LLM's reasoning (e.g. embedded text saying
-  "ignore price limits"). Every revenue module already includes a
-  code-level safety net that re-verifies price/stock/ID against the
-  LLM's decision rather than trusting it blindly — this already defends
-  against the *effect* of such an attack, but it hasn't been deliberately
-  tested with a crafted malicious description. Planned as a Phase 9
-  failure scenario.
+  tested.** Every revenue module already includes a code-level safety net
+  that re-verifies price/stock/ID against the LLM's decision rather than
+  trusting it blindly — this already defends against the *effect* of a
+  crafted-malicious-description attack, but it hasn't been deliberately
+  tested with one. Planned as a Phase 9 failure scenario.
 - **Liability and returns are out of scope.** What happens if the agent
   buys the wrong size/color, and who's responsible, isn't modeled. The
-  approval-gate on high-value orders indirectly reduces this risk, but a
-  full returns/liability framework is beyond buildathon scope.
-- **Agent-to-agent trust/interoperability is not applicable.** Concepts
-  like "how does Agent A know Agent B is legitimate" apply to
-  cross-company agent ecosystems. This project is a single buyer-agent
-  talking to a single merchant catalog — that scenario doesn't arise by
-  design, not by oversight.
+  approval-gate on high-value orders indirectly reduces this risk.
+- **Agent-to-agent trust/interoperability is not applicable.** This
+  project is a single buyer-agent talking to a single merchant catalog —
+  cross-company trust scenarios don't arise by design, not by oversight.
+- **Payment collection requires a browser (Checkout UI), not pure
+  server-to-server.** This is a Razorpay/PCI-DSS platform constraint, not
+  a design choice — discovered during Phase 5 after an initial (incorrect)
+  assumption that server-side card payments were possible. A minimal
+  `test_checkout.html` bridges this until the Phase 10 frontend exists.
 
 ---
 
-## Phase 1 Setup Instructions
+## Setup Instructions
 
 ### 1. Razorpay Test Account
 1. Sign up / log in at https://dashboard.razorpay.com
 2. Switch to **Test Mode** (toggle top-left of dashboard)
 3. Go to **Settings → API Keys → Generate Key**
-4. Copy `Key Id` and `Key Secret` — you will NOT see the secret again after
-   closing the popup, so save it immediately
+4. Copy `Key Id` and `Key Secret` into `.env`
 
 ### 2. Backend Setup
 ```bash
@@ -252,27 +267,34 @@ python -m venv venv
 venv\Scripts\activate      # on Mac/Linux: source venv/bin/activate
 pip install -r requirements.txt
 copy .env.example .env     # on Mac/Linux: cp .env.example .env
-# then fill in your real keys in .env
+# fill in RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, MISTRAL_API_KEY in .env
 ```
 
-### 3. Generate the Catalog
+### 3. Generate the Catalog + Build Search Index
 ```bash
 python scripts/generate_catalog.py
-```
-This downloads the real Myntra dataset from GitHub and builds
-`backend/data/catalog.json` (897 products).
-
-### 4. Build the Search Index
-```bash
 python ../catalog-service/build_embeddings.py
 ```
 
-### 5. Run the Backend
+### 4. Run the Backend
 ```bash
 python main.py
 ```
-Visit http://localhost:8000/catalog and http://localhost:8000/policy to
-confirm the catalog and policy data load correctly.
+Visit http://localhost:8000/catalog and http://localhost:8000/policy to confirm.
+
+### 5. Test the Full Policy + Payment Flow
+```bash
+python ../buyer-agent/policy_engine.py
+```
+For any `auto_approved` test result, a real Razorpay test-mode order is
+created. To actually complete a test payment (since there's no frontend
+yet), open `buyer-agent/test_checkout.html` in a browser, paste in the
+`razorpay_order_id` / `razorpay_key_id` from the script's output, and pay
+using Razorpay's official India test card:
+- **Card:** 4100 2800 0000 1007
+- **Expiry:** any future date · **CVV:** any random number
+- **OTP (if asked):** any 4+ digit number for success, <4 digits to
+  deliberately trigger a failure
 
 ### 6. Frontend Setup (Phase 10, not needed yet)
 ```bash
@@ -289,42 +311,29 @@ npm install -D tailwindcss postcss autoprefixer
 `backend/data/catalog.json` is built from a **real Myntra product dataset**
 (sourced via a public Bright Data sample on GitHub: ~1000 real Indian
 fashion e-commerce products with genuine INR pricing, ratings, and
-descriptions). It was cleaned to remove scraping artifacts (a number of
-rows had brand/store names mistakenly captured as the category — e.g.
-"BOLDFIT", "Milton", "RANDOM" — these were filtered out), leaving **897
-genuine products across 53 real categories** (Shirts, Watches, Tops,
-T-shirts, Wallets, Jeans, Sarees, Kurtas, Jackets, Dresses, personal care
-items, and more).
+descriptions). Cleaned to remove scraping artifacts (brand/store names
+mistakenly captured as category — e.g. "BOLDFIT", "Milton", "RANDOM"),
+leaving **897 genuine products across 53 real categories**.
 
-On top of the raw data, the following was added or corrected manually
-since the dataset doesn't include it or has gaps:
+Added or corrected manually since the raw dataset doesn't include it or
+has gaps:
 
-- **Stock quantities** — realistic spread, with ~26 items deliberately set
-  to 0. Out-of-stock items are excluded from search results entirely
-  (Phase 2); the failure-demo (Phase 9) instead simulates a realistic
-  "race condition" — an item appears available at search/selection time,
-  but a fresh stock check at payment time reveals it just sold out —
-  rather than showing dead stock in search.
-- **Gender-aware complementary-item mapping** — built via a category-group
-  rule engine (e.g. tops ↔ accessories/bottoms/footwear, personal care ↔
-  personal care), preferring same-gender candidates so the buyer agent
-  isn't handed nonsensical hints (e.g. a women's watch for a men's shirt).
-  3 candidates are generated per outfit-slot (not just 1), giving the
-  agent's reasoning step genuine alternatives to choose from. This field
-  is a **candidate hint**, not a final answer — the buyer agent decides
-  whether to actually offer a given item, based on style, budget, and
-  policy, and explains that decision.
-- **Ratings** — 147 of the 897 products had no rating in the original
-  dataset (raw value 0.0, meaning "no reviews yet"). These were assigned a
-  synthetic rating between 3.5 and 4.8 so the demo doesn't show an
-  unrealistic 0-star product being recommended. **This is disclosed here
-  for transparency — these specific rating values are not real customer
+- **Stock quantities** — ~26 items deliberately set to 0. Out-of-stock
+  items are excluded from search entirely; the Phase 9 failure-demo
+  instead simulates a stock race-condition at payment time.
+- **Gender-aware complementary-item mapping** — a category-group rule
+  engine (e.g. tops ↔ accessories/bottoms/footwear) preferring
+  same-gender candidates, with 3 candidates generated per outfit-slot so
+  the agent's reasoning has genuine alternatives. This field is a
+  **candidate hint**, not a final answer — the buyer agent decides
+  relevance, style, and budget-fit, and explains that decision.
+- **Ratings** — 147 of 897 products had no rating in the original dataset
+  (0.0, meaning "no reviews yet"); reassigned a synthetic rating between
+  3.5 and 4.8. **Disclosed here for transparency — not real customer
   data.** The remaining ~750 products carry genuine Myntra ratings.
-- Each product also carries a real `image_url` from Myntra's CDN
-  (assets.myntassets.com). **Note:** the dataset is from 2021-2022, so a
-  few image links may be dead or blocked by hotlink protection. Test these
-  in the actual frontend and add an `onError` fallback so a broken image
-  never breaks the UI during a live demo:
+- Each product carries a real `image_url` from Myntra's CDN. The dataset
+  is from 2021-2022, so a few links may be dead — add an `onError`
+  fallback in the frontend:
 
 ```jsx
 <img
@@ -335,11 +344,8 @@ since the dataset doesn't include it or has gaps:
 ```
 
 5 products naturally exceed the ₹10,000 approval-gate threshold, so
-gate/approval scenarios trigger organically without needing to hardcode
-special-case products.
-
-The full pipeline is reproducible via `backend/scripts/generate_catalog.py`
-— running it regenerates the exact same catalog from the raw dataset.
+gate/approval scenarios trigger organically. Fully reproducible via
+`backend/scripts/generate_catalog.py`.
 
 ---
 
@@ -349,44 +355,38 @@ agentic-commerce/
 ├── backend/
 │ ├── data/
 │ │ ├── catalog.json # 897 real Myntra-sourced products
-│ │ ├── policy.json # spend caps, gate thresholds, cart incentives
+│ │ ├── policy.json # spend caps, gate thresholds, cart incentives, consent schema
 │ │ ├── faiss_index.bin # FAISS semantic search index
-│ │ └── faiss_id_map.json # FAISS position -> product ID mapping
-│ ├── scripts/
-│ │ └── generate_catalog.py # regenerates catalog.json from the raw dataset
-│ ├── routes/ # API route modules (added Phase 4+)
-│ ├── models/ # Pydantic schemas (added Phase 4+)
-│ ├── main.py # FastAPI app entrypoint
+│ │ └── faiss_id_map.json
+│ ├── scripts/generate_catalog.py
+│ ├── main.py
 │ ├── requirements.txt
 │ └── .env.example
 ├── catalog-service/
-│ ├── build_embeddings.py # builds the FAISS index (Phase 2)
-│ ├── bm25_search.py # keyword search (Phase 2)
-│ ├── query_parser.py # price-constraint extraction (Phase 2)
-│ └── hybrid_search.py # combined FAISS+BM25+RRF search (Phase 2)
+│ ├── build_embeddings.py
+│ ├── bm25_search.py
+│ ├── query_parser.py
+│ └── hybrid_search.py
 ├── buyer-agent/
-│ ├── reasoning_engine.py # core product-selection reasoning (Phase 3)
+│ ├── reasoning_engine.py # core product-selection (Phase 3)
 │ ├── upsell_true.py # same-category premium upgrade (Phase 3)
-│ ├── complete_the_look.py # multi-item complementary suggestions (Phase 3)
+│ ├── complete_the_look.py # multi-item complementary suggestions, priority-ranked (Phase 3)
 │ ├── similar_items.py # same-category alternatives (Phase 3)
-│ └── cart_nudge.py # cart-value threshold nudge (Phase 3)
+│ ├── cart_nudge.py # cart-value threshold nudge (Phase 3)
+│ ├── policy_engine.py # orchestrates everything + Razorpay + approval-gate (Phase 4/5)
+│ ├── razorpay_client.py # order creation, signature verification (Phase 5)
+│ └── test_checkout.html # temporary manual-test page (not the real frontend)
 ├── audit-service/ # logging + dashboard API (Phase 7)
 └── frontend/ # React UI (Phase 10)
-
-
+  
 
 ## Policy Summary (data/policy.json)
 - Max spend per transaction: ₹20,000 (merchant-side bound)
 - Approval gate triggers above: ₹10,000
 - Free-delivery cart-nudge threshold: ₹1,999 (nudge shown if within 30% of it)
-- Customer-side primary/add-ons budgets: see *Purchase Architecture* above
-  (implemented in Phase 4)
+- Customer-side primary/add-ons budgets: enforced per-purchase in `policy_engine.py`
 
-## Next Steps (Phase 4)
-- Build the Policy Engine: enforce spend-caps and the approval-gate in code
-  (not just as config)
-- Implement the customer consent/budget schema from *Purchase Architecture*
-  (primary-item budget, opt-in add-ons budget, Fully-Autonomous vs
-  Human-Browse mode)
-- Wire the four revenue modules (Phase 3) into this policy layer so their
-  decisions are actually bounded, not just individually tested
+## Next Steps (Phase 6)
+- Add a LinUCB (or Thompson Sampling) bandit to the product-selection step
+- Design a reward signal (successful bounded purchase = positive reward)
+- Test that the agent's choices measurably improve over simulated rounds  

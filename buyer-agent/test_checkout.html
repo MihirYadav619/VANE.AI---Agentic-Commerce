@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Razorpay Test Checkout</title>
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+</head>
+<body style="font-family: sans-serif; max-width: 500px; margin: 50px auto;">
+    <h2>Test Payment</h2>
+    <p>Paste values from your Python script's output:</p>
+
+    <label>Razorpay Key ID:</label><br>
+    <input type="text" id="keyId" style="width: 100%; padding: 8px;"><br><br>
+
+    <label>Order ID:</label><br>
+    <input type="text" id="orderId" style="width: 100%; padding: 8px;"><br><br>
+
+    <label>Amount (in ₹):</label><br>
+    <input type="number" id="amount" value="692" style="width: 100%; padding: 8px;"><br><br>
+
+    <button onclick="payNow()" style="padding: 10px 20px; font-size: 16px;">Pay Now</button>
+
+    <div id="result" style="margin-top: 20px; padding: 10px; background: #f0f0f0;"></div>
+
+    <script>
+        function payNow() {
+            const options = {
+                key: document.getElementById('keyId').value,
+                amount: document.getElementById('amount').value * 100,
+                currency: "INR",
+                name: "Agentic Commerce Test",
+                order_id: document.getElementById('orderId').value,
+                handler: function (response) {
+                    document.getElementById('result').innerHTML =
+                        "<b>SUCCESS</b><br>" +
+                        "Payment ID: " + response.razorpay_payment_id + "<br>" +
+                        "Order ID: " + response.razorpay_order_id + "<br>" +
+                        "Signature: " + response.razorpay_signature;
+                },
+                modal: {
+                    ondismiss: function () {
+                        document.getElementById('result').innerHTML = "<b>Payment cancelled/failed.</b>";
+                    }
+                }
+            };
+            const rzp = new Razorpay(options);
+            rzp.open();
+        }
+    </script>
+</body>
+</html>

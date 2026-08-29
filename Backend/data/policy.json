@@ -31,5 +31,9 @@
   "cart_incentives": {
     "free_delivery_threshold": 1999,
     "nudge_trigger_max_gap_percentage": 30
+  },
+  "customer_consent": {
+    "mode_options": ["autonomous", "browse"],
+    "default_mode": "browse"
   }
 }

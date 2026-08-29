@@ -1,18 +1,21 @@
 """
 Phase 3 - Step 2 (revised): "Complete the Look" — multi-item complementary
-suggestions.
+suggestions with priority-ranking.
 
 Key design decisions (from testing/debugging):
 1. Supports 0 to several suggested items, one per "outfit slot"
    (topwear, bottomwear, footwear, accessory, etc.) — not a fixed count.
-2. No strict "25% of main price" budget cap — testing showed it was
-   miscalibrated against this catalog's price distribution. Real
-   spend-bounding happens at the ORDER-TOTAL level via the policy engine's
-   approval-gate (Phase 4), not a tight per-item rule here. Only a loose
-   5x sanity-check blocks genuinely absurd mismatches.
+2. No strict "25% of main price" budget cap — real spend-bounding happens
+   at the order-total / addons-budget level in policy_engine.py (Phase 4),
+   not a tight per-item rule here. Only a loose 5x sanity-check blocks
+   genuinely absurd mismatches.
 3. ONE ITEM PER SLOT: a real outfit has one top, one pair of shoes, one
    accessory — not three competing tops. Each candidate is tagged with
    its "slot" so the LLM can enforce this rule explicitly.
+4. PRIORITY-RANKED: the LLM ranks its suggestions by importance
+   (priority_rank: 1 = most valuable). This lets policy_engine.py decide
+   which items to keep first if the customer's stated addons-budget can't
+   fit everything — instead of an arbitrary list-order.
 """
 
 import json
@@ -32,15 +35,8 @@ except ImportError:
 MODEL_NAME = "mistral-small-2603"
 client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
 
-# Loose sanity-check only — NOT a tight budget rule. Blocks only absurd
-# mismatches; real spend-bounding happens at the order-total level
-# (Phase 4's approval-gate).
 MAX_SANITY_PRICE_MULTIPLIER = 5.0
 
-# Lightweight duplicate of generate_catalog.py's category grouping, used
-# here only to tell the LLM which "outfit slot" each candidate fills —
-# so it can enforce "at most one item per slot" (e.g. don't suggest two
-# different tops alongside the same pair of leggings).
 CATEGORY_TO_SLOT = {
     "Shirts": "topwear", "Tshirts": "topwear", "Tops": "topwear", "Jackets": "topwear", "Kurtis": "topwear",
     "Jeans": "bottomwear", "Track Pants": "bottomwear", "Palazzos": "bottomwear", "Trousers": "bottomwear",
@@ -65,21 +61,31 @@ COMPLETE_LOOK_TOOL = {
     "type": "function",
     "function": {
         "name": "record_complete_the_look_decision",
-        "description": "Records which complementary items (if any) to suggest alongside the main purchase.",
+        "description": "Records which complementary items (if any) to suggest alongside the main purchase, ranked by priority.",
         "parameters": {
             "type": "object",
             "properties": {
-                "suggested_product_ids": {
+                "suggested_items": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "IDs of the candidates worth suggesting — at most ONE per slot. Empty array if none are genuinely relevant."
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "product_id": {"type": "string"},
+                            "priority_rank": {
+                                "type": "integer",
+                                "description": "1 = most important/valuable addition to this outfit, higher numbers = less critical. Used to decide which items to keep if budget doesn't allow all of them."
+                            }
+                        },
+                        "required": ["product_id", "priority_rank"]
+                    },
+                    "description": "Suggested candidates ranked by priority (1 = most important) — at most ONE per slot. Empty array if none are genuinely relevant."
                 },
                 "reasoning": {
                     "type": "string",
-                    "description": "Clear explanation covering all candidates — why each was included or excluded, for the audit trail."
+                    "description": "Clear explanation covering all candidates — why each was included/excluded and why it was ranked where it was, for the audit trail."
                 }
             },
-            "required": ["suggested_product_ids", "reasoning"]
+            "required": ["suggested_items", "reasoning"]
         }
     }
 }
@@ -107,6 +113,10 @@ Rules you must follow:
 3. You may suggest anywhere from 0 to one-per-available-slot — whatever
    forms a genuinely coherent, sensible set. Do not suggest a candidate
    just to fill a quota.
+3a. When suggesting multiple items, assign each a priority_rank (1 = most
+    valuable/important addition, higher = less critical). This determines
+    which items get kept if the customer's budget can't fit all of them,
+    so rank thoughtfully based on genuine outfit-completion value.
 4. A candidate priced noticeably higher than the main item can still be a
    reasonable suggestion, as long as the combination feels like a normal
    purchase. Only reject on price grounds if the jump seems absurd.
@@ -115,11 +125,6 @@ Rules you must follow:
 
 
 def get_sane_candidates(main_product, catalog_products_by_id):
-    """
-    Pre-filters the catalog's complementary_items hints down to ones that
-    pass basic sanity checks (in stock, not an absurd price multiple)
-    before showing them to the LLM.
-    """
     candidate_ids = main_product.get("complementary_items", [])
     candidates = []
     for cid in candidate_ids:
@@ -154,7 +159,7 @@ def decide_complete_the_look(main_product, catalog_products_by_id):
         f"Main product being purchased: {main_product['name']} "
         f"(category: {main_product['category']}, price: ₹{main_product['price']})\n\n"
         f"Candidate complementary items:\n{candidate_lines}\n\n"
-        f"Decide which of these (if any) to suggest as add-ons. Remember: at most ONE per slot."
+        f"Decide which of these (if any) to suggest as add-ons, ranked by priority. Remember: at most ONE per slot."
     )
 
     response = client.chat.complete(
@@ -165,63 +170,59 @@ def decide_complete_the_look(main_product, catalog_products_by_id):
         ],
         tools=[COMPLETE_LOOK_TOOL],
         tool_choice="any",
-        max_tokens=1000,  # generous limit so multi-candidate reasoning doesn't get cut off
+        max_tokens=1000,
     )
 
     tool_call = response.choices[0].message.tool_calls[0]
     decision = json.loads(tool_call.function.arguments)
 
-    # Code-level safety net #1: only keep suggested ids that were actually
-    # among the candidates we offered.
-    valid_ids = {c["id"] for c in candidates}
-    original_suggestions = decision.get("suggested_product_ids", [])
-    filtered_suggestions = [pid for pid in original_suggestions if pid in valid_ids]
+    # Sort by priority_rank (ascending, so rank 1 comes first) before
+    # applying validity/slot-uniqueness checks.
+    raw_items = decision.get("suggested_items", [])
+    raw_items.sort(key=lambda x: x["priority_rank"])
 
-    # Code-level safety net #2: enforce "one per slot" in code too, in case
-    # the LLM violates its own instruction. If multiple suggested items
-    # share a slot, keep only the first one encountered (arbitrary but
-    # deterministic tie-break) and drop the rest.
+    valid_ids = {c["id"] for c in candidates}
+    filtered_items = [item for item in raw_items if item["product_id"] in valid_ids]
+
+    # Code-level safety net: enforce "one per slot" in code too, in case
+    # the LLM violates its own instruction. Since filtered_items is
+    # already priority-sorted, keeping the first-seen per slot
+    # automatically keeps the highest-priority item for that slot.
     seen_slots = set()
-    final_suggestions = []
-    for pid in filtered_suggestions:
+    final_ids = []
+    for item in filtered_items:
+        pid = item["product_id"]
         product = catalog_products_by_id[pid]
         slot = CATEGORY_TO_SLOT.get(product["category"], "other")
         if slot in seen_slots:
             continue
         seen_slots.add(slot)
-        final_suggestions.append(pid)
+        final_ids.append(pid)
 
-    if len(final_suggestions) != len(original_suggestions):
+    if len(final_ids) != len(raw_items):
         decision["reasoning"] += " (Note: some suggested ids were dropped by a code-level validity/slot-uniqueness check.)"
-    decision["suggested_product_ids"] = final_suggestions
+
+    # suggested_product_ids is now priority-ordered (rank 1 first) — this
+    # is what policy_engine.py's budget-allocation loop consumes, so it
+    # automatically respects priority without any change needed there.
+    decision["suggested_product_ids"] = final_ids
 
     return decision
 
 
-# Add this as a separate test in complete_the_look.py's __main__ block (or run standalone)
 if __name__ == "__main__":
+    import random
+
     CATALOG_PATH = Path(__file__).parent.parent / "backend" / "data" / "catalog.json"
     with open(CATALOG_PATH, "r", encoding="utf-8") as f:
         catalog = json.load(f)
     products_by_id = {p["id"]: p for p in catalog["products"]}
 
-    # Focused test: ONLY Watches/Wallets, to check if accessories
-    # systematically get fewer suggestions than garments.
-    accessory_products = [
-        p for p in catalog["products"]
-        if p["category"] in ("Watches", "Wallets") and p["stock"] > 0 and p["complementary_items"]
-    ]
+    random.seed(3)
+    eligible = [p for p in catalog["products"] if p["stock"] > 0 and p["complementary_items"]]
+    sample = random.sample(eligible, min(10, len(eligible)))
 
-    import random
-    random.seed(5)
-    sample = random.sample(accessory_products, min(15, len(accessory_products)))
-
-    zero_count = 0
     for main in sample:
         result = decide_complete_the_look(main, products_by_id)
-        n = len(result["suggested_product_ids"])
-        if n == 0:
-            zero_count += 1
-        print(f"{main['name'][:45]} (₹{main['price']}) -> {n} suggested")
-
-    print(f"\nZero-suggestion rate for accessories: {zero_count}/{len(sample)}")
+        print(f"\n{main['name'][:50]} (₹{main['price']}) -> {result['suggested_product_ids']}")
+        print(f"  Reasoning: {result['reasoning'][:300]}")
