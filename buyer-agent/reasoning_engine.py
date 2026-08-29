@@ -1,30 +1,41 @@
 """
-Phase 3 - Step 1: Core buyer-agent reasoning (Mistral AI version).
+Phase 3 - Step 1 (revised for Phase 6): Core buyer-agent reasoning with
+LinUCB bandit refinement.
 
 Takes a natural-language user request, retrieves candidates via hybrid
 search (Phase 2), and asks an LLM to judge which candidate(s) genuinely
 match the user's intent — with an explicit, honest "no good match" path
 instead of always forcing a pick.
+
+Phase 6 addition: once the LLM identifies a genuine match, if there are
+OTHER candidates in the same category that are equally valid options, a
+LinUCB bandit refines the final pick — but ONLY once that category has
+accumulated enough real purchase-history (see bandit.py's
+has_sufficient_data()) to have a genuinely learned preference, rather
+than a cold-start exploration artifact.
 """
 
 import json
 import os
 import sys
 from pathlib import Path
+
 from dotenv import load_dotenv
 
-# .env lives in backend/, but this script lives in buyer-agent/ — a SIBLING
-# folder, not a parent. load_dotenv()'s default upward-search only checks
-# parent directories, so it would never find backend/.env from here.
-# We give it the explicit path instead of relying on auto-discovery.
 ENV_PATH = Path(__file__).parent.parent / "backend" / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
-from mistralai.client import Mistral
+
+try:
+    from mistralai.client import Mistral
+except ImportError:
+    from mistralai import Mistral
 
 sys.path.append(str(Path(__file__).parent.parent / "catalog-service"))
+sys.path.append(str(Path(__file__).parent))
 from hybrid_search import HybridSearch
+from bandit import LinUCBBandit
 
-MODEL_NAME = "mistral-small-2603"  # good balance of reasoning quality + free-tier friendliness
+MODEL_NAME = "mistral-small-2603"
 NUM_CANDIDATES_TO_SHOW_LLM = 8
 
 client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
@@ -40,8 +51,6 @@ def build_candidate_summary(products):
     return "\n".join(lines)
 
 
-# Mistral uses the OpenAI-style tool schema: {"type": "function", "function": {...}}
-# rather than Anthropic's flatter {"name": ..., "input_schema": ...} format.
 REASONING_TOOL = {
     "type": "function",
     "function": {
@@ -101,13 +110,20 @@ Rules you must follow:
 4. Keep your reasoning concise (1-3 sentences) and concrete.
 5. You must call the record_decision tool exactly once with your answer."""
 
+
 class BuyerAgent:
     def __init__(self):
         print("Initializing buyer agent (loading search engine)...")
         self.search_engine = HybridSearch()
+        self.bandit = LinUCBBandit()
         print("Buyer agent ready.")
 
     def decide(self, user_query):
+        """
+        Runs the full reasoning step: search -> LLM judgment -> bandit
+        refinement (only if the category has enough history) -> structured
+        decision. Returns a dict with the decision details.
+        """
         candidates = self.search_engine.search(user_query, top_k=NUM_CANDIDATES_TO_SHOW_LLM)
 
         if not candidates:
@@ -117,6 +133,7 @@ class BuyerAgent:
                 "reasoning": "No candidates were returned by search for this query.",
                 "confidence": "high",
                 "candidates_considered": [],
+                "bandit_applied": False,
             }
 
         candidate_text = build_candidate_summary(candidates)
@@ -134,16 +151,48 @@ class BuyerAgent:
                 {"role": "user", "content": user_message},
             ],
             tools=[REASONING_TOOL],
-            tool_choice="any",  # forces the model to call a tool rather than reply in plain text
+            tool_choice="any",
         )
 
-        # Mistral returns tool calls with arguments as a JSON *string*,
-        # unlike Anthropic which returns them as an already-parsed dict —
-        # so we need an explicit json.loads() here.
         tool_call = response.choices[0].message.tool_calls[0]
         decision = json.loads(tool_call.function.arguments)
-
         decision["candidates_considered"] = [c["id"] for c in candidates]
+
+        if decision["match_found"]:
+            selected = next(c for c in candidates if c["id"] == decision["selected_product_id"])
+
+            # Find other candidates in the SAME category as the LLM's pick
+            # — these are the genuinely-comparable options the bandit
+            # should choose among.
+            same_category_pool = [c for c in candidates if c["category"] == selected["category"]]
+
+            if len(same_category_pool) > 1:
+                has_enough_data = self.bandit.has_sufficient_data(selected["category"])
+
+                if has_enough_data:
+                    bandit_choice = self.bandit.select(same_category_pool, category=selected["category"])
+                    if bandit_choice["id"] != selected["id"]:
+                        decision["reasoning"] += (
+                            f" (Bandit refined the final pick from {selected['id']} to "
+                            f"{bandit_choice['id']} based on learned success patterns in this category.)"
+                        )
+                        decision["selected_product_id"] = bandit_choice["id"]
+                    decision["bandit_applied"] = True
+                else:
+                    # Not enough real purchase history yet — trust the
+                    # LLM's pick as-is. The bandit still silently observes
+                    # this decision in the background (via update() after
+                    # the outcome is known), but doesn't influence the
+                    # choice until it has genuine signal to act on.
+                    decision["bandit_applied"] = False
+                    decision["bandit_status"] = "collecting_data_not_yet_overriding"
+
+                decision["bandit_candidate_pool"] = [c["id"] for c in same_category_pool]
+            else:
+                decision["bandit_applied"] = False
+        else:
+            decision["bandit_applied"] = False
+
         return decision
 
 
@@ -151,14 +200,9 @@ if __name__ == "__main__":
     agent = BuyerAgent()
 
     test_queries = [
-        "kurta between 1000 and 2000",       # range-based price
-        "wallet above 500",                    # minimum-price constraint
-        "formal shirt",                        # generic, no extra attributes
-        "a red saree",                         # may not exist in catalog
-        "kurta for a wedding",                 # vague/contextual, no hard attributes
-        "cheap wallet",                        # subjective price-word (not a number)
-        "blue kurta under 1000 with good rating",  # multiple constraints at once
-        "formal watch for men under 3000",     # explicit gender this time
+        "I need a formal shirt for office, comfortable fit",
+        "blue denim jacket",
+        "watch under 5000",
     ]
 
     for q in test_queries:

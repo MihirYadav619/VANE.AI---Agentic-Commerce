@@ -15,6 +15,7 @@ sys.path.append(str(Path(__file__).parent))
 sys.path.append(str(Path(__file__).parent.parent / "catalog-service"))
 from razorpay_client import create_order
 
+from bandit import LinUCBBandit
 from reasoning_engine import BuyerAgent
 from upsell_true import find_upgrade_candidates, decide_upsell_upgrade
 from complete_the_look import decide_complete_the_look
@@ -57,7 +58,13 @@ class PolicyEngine:
         self.products_by_id = {p["id"]: p for p in self.all_products}
         self.policy = load_policy()
         print("Policy engine ready.")
-
+    def __init__(self):
+        print("Initializing policy engine (loading agent + catalog)...")
+        self.buyer_agent = BuyerAgent()
+        self.all_products = load_catalog()
+        self.products_by_id = {p["id"]: p for p in self.all_products}
+        self.policy = load_policy()
+        print("Policy engine ready.")
     def build_order(self, query, mode="browse", addons_opted_in=False, addons_budget=0):
         """
         Runs the full pipeline and returns a structured order-decision.
@@ -210,7 +217,37 @@ class PolicyEngine:
             )
             result["razorpay_order_id"] = razorpay_order["id"]
             result["razorpay_key_id"] = os.environ["RAZORPAY_KEY_ID"]
+        if status == "auto_approved":
+            import uuid
+            razorpay_order = create_order(
+                amount_rupees=order_total,
+                receipt_id=f"order_{uuid.uuid4().hex[:10]}",
+                notes={
+                    "item_ids": ",".join(p["id"] for p in order_items),
+                    "reasoning_summary": decision_log[0]["reasoning"][:500],
+                },
+            )
+            result["razorpay_order_id"] = razorpay_order["id"]
+            result["razorpay_key_id"] = os.environ["RAZORPAY_KEY_ID"]
 
+            # Feed the outcome back to the bandit: an auto-approved order
+            # means the buyer agent's product-selection led to a
+            # successfully-completed decision-flow (reward = success).
+            # This is what makes bandit_had_prior_learning eventually
+            # become True for categories with enough purchase history.
+            main_item = order_items[0]
+            same_category_products = [
+                p for p in self.all_products if p["category"] == main_item["category"]
+            ]
+            if len(same_category_products) > 1:
+                self.buyer_agent.bandit.update(
+                    chosen_product=main_item,
+                    all_candidates=same_category_products,
+                    category=main_item["category"],
+                    reward=1.0,
+                )
+
+        
         return result
 
     def _decide_upgrade_from_candidates(self, main_product, candidates):
