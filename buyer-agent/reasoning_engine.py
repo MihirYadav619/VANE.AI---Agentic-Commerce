@@ -1,6 +1,6 @@
 """
-Phase 3 - Step 1 (revised for Phase 6): Core buyer-agent reasoning with
-LinUCB bandit refinement.
+Phase 3 - Step 1 (revised for Phase 6/7): Core buyer-agent reasoning with
+LinUCB bandit refinement and merchant-agent promotion-awareness.
 
 Takes a natural-language user request, retrieves candidates via hybrid
 search (Phase 2), and asks an LLM to judge which candidate(s) genuinely
@@ -10,9 +10,14 @@ instead of always forcing a pick.
 Phase 6 addition: once the LLM identifies a genuine match, if there are
 OTHER candidates in the same category that are equally valid options, a
 LinUCB bandit refines the final pick — but ONLY once that category has
-accumulated enough real purchase-history (see bandit.py's
-has_sufficient_data()) to have a genuinely learned preference, rather
-than a cold-start exploration artifact.
+accumulated enough real purchase-history to have a genuinely learned
+preference, rather than a cold-start exploration artifact.
+
+Phase 7 addition: before reasoning, the buyer-agent checks whether the
+independent merchant-side agent has published any active promotions
+relevant to the candidate categories — this is the multi-agent
+interaction point: two separately-decision-making agents, communicating
+through a shared, auditable signal (not a hardcoded coupling).
 """
 
 import json
@@ -32,8 +37,10 @@ except ImportError:
 
 sys.path.append(str(Path(__file__).parent.parent / "catalog-service"))
 sys.path.append(str(Path(__file__).parent))
+sys.path.append(str(Path(__file__).parent.parent / "merchant-agent"))
 from hybrid_search import HybridSearch
 from bandit import LinUCBBandit
+from merchant_agent import get_active_promotions
 
 MODEL_NAME = "mistral-small-2603"
 NUM_CANDIDATES_TO_SHOW_LLM = 8
@@ -69,7 +76,7 @@ REASONING_TOOL = {
                 },
                 "reasoning": {
                     "type": "string",
-                    "description": "A clear, human-readable explanation of why this product was chosen (or why none matched). This will be shown in the audit trail."
+                    "description": "A clear, human-readable explanation of why this product was chosen (or why none matched). Mention any active merchant promotion relevant to the chosen product. This will be shown in the audit trail."
                 },
                 "confidence": {
                     "type": "string",
@@ -90,6 +97,14 @@ Important context: any price constraint in the user's request (e.g. "under \
 candidate list — every candidate shown to you already satisfies the price \
 requirement. Do NOT re-check or re-calculate prices against the user's \
 budget; take it as given that all candidates are within budget.
+
+You may also be shown active merchant promotions for some categories —
+these come from an independent merchant-side agent's own demand-analysis,
+not from you. If a promotion applies to the category of the candidate you
+select, mention it naturally in your reasoning (e.g. "this category
+currently has a merchant-offered discount"). Do not let a promotion cause
+you to pick a worse-matching candidate just because its category has a
+discount — the match-quality judgment below still comes first.
 
 Rules you must follow:
 1. Only consider constraints the user EXPLICITLY stated (category, explicit \
@@ -120,9 +135,9 @@ class BuyerAgent:
 
     def decide(self, user_query):
         """
-        Runs the full reasoning step: search -> LLM judgment -> bandit
-        refinement (only if the category has enough history) -> structured
-        decision. Returns a dict with the decision details.
+        Runs the full reasoning step: search -> promotion-check ->
+        LLM judgment -> bandit refinement (only if the category has
+        enough history) -> structured decision.
         """
         candidates = self.search_engine.search(user_query, top_k=NUM_CANDIDATES_TO_SHOW_LLM)
 
@@ -136,12 +151,33 @@ class BuyerAgent:
                 "bandit_applied": False,
             }
 
+        # Check if the merchant-agent has an active promotion for any
+        # category among these candidates — this is the buyer-agent
+        # "listening" to the merchant-agent's independent decision,
+        # via a shared file, not a hardcoded coupling between the two.
+        active_promotions = get_active_promotions()
+        candidate_categories = {c["category"] for c in candidates}
+        relevant_promotions = {
+            cat: details for cat, details in active_promotions.items()
+            if cat in candidate_categories
+        }
+
         candidate_text = build_candidate_summary(candidates)
+
+        promotion_note = ""
+        if relevant_promotions:
+            promo_lines = "\n".join(
+                f"- {cat}: {details['discount_percentage']}% off (merchant-agent promotion: {details['reason']})"
+                for cat, details in relevant_promotions.items()
+            )
+            promotion_note = f"\n\nActive merchant promotions relevant to these candidates:\n{promo_lines}"
 
         user_message = (
             f"User request: \"{user_query}\"\n\n"
-            f"Candidate products (from catalog search):\n{candidate_text}\n\n"
-            f"Decide which candidate (if any) genuinely matches the user's request."
+            f"Candidate products (from catalog search):\n{candidate_text}"
+            f"{promotion_note}\n\n"
+            f"Decide which candidate (if any) genuinely matches the user's request. "
+            f"If a promotion applies to the category of your chosen candidate, mention it in your reasoning."
         )
 
         response = client.chat.complete(
@@ -157,13 +193,10 @@ class BuyerAgent:
         tool_call = response.choices[0].message.tool_calls[0]
         decision = json.loads(tool_call.function.arguments)
         decision["candidates_considered"] = [c["id"] for c in candidates]
+        decision["active_promotions_seen"] = relevant_promotions
 
         if decision["match_found"]:
             selected = next(c for c in candidates if c["id"] == decision["selected_product_id"])
-
-            # Find other candidates in the SAME category as the LLM's pick
-            # — these are the genuinely-comparable options the bandit
-            # should choose among.
             same_category_pool = [c for c in candidates if c["category"] == selected["category"]]
 
             if len(same_category_pool) > 1:
@@ -179,11 +212,6 @@ class BuyerAgent:
                         decision["selected_product_id"] = bandit_choice["id"]
                     decision["bandit_applied"] = True
                 else:
-                    # Not enough real purchase history yet — trust the
-                    # LLM's pick as-is. The bandit still silently observes
-                    # this decision in the background (via update() after
-                    # the outcome is known), but doesn't influence the
-                    # choice until it has genuine signal to act on.
                     decision["bandit_applied"] = False
                     decision["bandit_status"] = "collecting_data_not_yet_overriding"
 

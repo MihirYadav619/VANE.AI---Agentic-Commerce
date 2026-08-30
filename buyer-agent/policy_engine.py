@@ -3,23 +3,35 @@ Phase 4 - Policy Engine: orchestrates the full buyer-agent pipeline
 (product selection -> upsell/cross-sell -> approval-gate check) according
 to the customer's chosen mode and stated budgets.
 
-This is the "glue" layer that turns the individually-tested modules from
-Phase 3 into one coherent, bounded, auditable purchase flow.
+Phase 6 addition: bandit-based product-selection refinement, with
+reward-feedback wired here.
+
+Phase 7 addition: every decision and the final transaction outcome are
+logged to the SQLite audit trail, keyed by a per-purchase session_id.
+
+Phase 8 addition: after every successful (auto_approved) transaction, the
+merchant-side agent automatically re-evaluates demand and updates its
+promotions — this closes the multi-agent loop autonomously, without a
+human needing to manually re-run the merchant-agent script.
 """
 
 import json
-import sys
-from pathlib import Path
 import os
+import sys
+import uuid
+from pathlib import Path
+
 sys.path.append(str(Path(__file__).parent))
 sys.path.append(str(Path(__file__).parent.parent / "catalog-service"))
-from razorpay_client import create_order
+sys.path.append(str(Path(__file__).parent.parent / "audit-service"))
+sys.path.append(str(Path(__file__).parent.parent / "merchant-agent"))
 
-from bandit import LinUCBBandit
 from reasoning_engine import BuyerAgent
-from upsell_true import find_upgrade_candidates, decide_upsell_upgrade
+from upsell_true import find_upgrade_candidates
 from complete_the_look import decide_complete_the_look
-from hybrid_search import HybridSearch
+from razorpay_client import create_order
+from audit_db import init_db, log_decision, log_transaction
+from merchant_agent import run_merchant_agent
 
 POLICY_PATH = Path(__file__).parent.parent / "backend" / "data" / "policy.json"
 CATALOG_PATH = Path(__file__).parent.parent / "backend" / "data" / "catalog.json"
@@ -39,7 +51,9 @@ class PolicyEngine:
     """
     Ties together product-selection and the revenue modules into one
     order-building flow, enforcing customer-stated budgets and the
-    merchant-side approval-gate.
+    merchant-side approval-gate. Every decision step is logged to the
+    audit trail, and a successful order triggers the merchant-agent's
+    own independent decision-cycle.
 
     Usage:
         engine = PolicyEngine()
@@ -53,68 +67,82 @@ class PolicyEngine:
 
     def __init__(self):
         print("Initializing policy engine (loading agent + catalog)...")
-        self.buyer_agent = BuyerAgent()  # this loads hybrid search internally
-        self.all_products = load_catalog()
-        self.products_by_id = {p["id"]: p for p in self.all_products}
-        self.policy = load_policy()
-        print("Policy engine ready.")
-    def __init__(self):
-        print("Initializing policy engine (loading agent + catalog)...")
         self.buyer_agent = BuyerAgent()
         self.all_products = load_catalog()
         self.products_by_id = {p["id"]: p for p in self.all_products}
         self.policy = load_policy()
+        init_db()
         print("Policy engine ready.")
+
     def build_order(self, query, mode="browse", addons_opted_in=False, addons_budget=0):
         """
         Runs the full pipeline and returns a structured order-decision.
-
-        mode: "autonomous" or "browse"
-          - "autonomous": the engine finalizes the order itself (subject to
-            the approval-gate for high-value totals).
-          - "browse": the engine returns all candidate options (main item +
-            possible upsell + possible complementary items) WITHOUT
-            finalizing anything — a human is expected to pick, then call
-            finalize_selection() separately (Phase 5 will wire this to
-            actual payment).
-
-        addons_opted_in / addons_budget: only relevant in "autonomous" mode
-          — whether the customer allowed Complete-the-Look, and the budget
-          ceiling for it (see README's "Purchase Architecture" section).
+        Every call gets its own session_id, used to group all logged
+        decisions + the final transaction in the audit trail.
         """
         if mode not in ("autonomous", "browse"):
             raise ValueError(f"Invalid mode: {mode}. Must be 'autonomous' or 'browse'.")
 
-        # Step 1: Select the main product (Phase 3's core reasoning engine).
+        session_id = f"session_{uuid.uuid4().hex[:12]}"
+
         main_decision = self.buyer_agent.decide(query)
+
+        log_decision(
+            session_id=session_id,
+            decision_type="main_selection",
+            product_ids=[main_decision["selected_product_id"]] if main_decision["match_found"] else [],
+            reasoning=main_decision["reasoning"],
+            metadata={
+                "confidence": main_decision.get("confidence"),
+                "bandit_applied": main_decision.get("bandit_applied", False),
+                "bandit_status": main_decision.get("bandit_status"),
+                "match_found": main_decision["match_found"],
+                "active_promotions_seen": main_decision.get("active_promotions_seen", {}),
+            },
+        )
 
         if not main_decision["match_found"]:
             return {
                 "status": "no_match",
                 "reasoning": main_decision["reasoning"],
                 "order": None,
+                "session_id": session_id,
             }
 
         main_product = self.products_by_id[main_decision["selected_product_id"]]
 
         if mode == "browse":
-            return self._build_browse_options(main_product, main_decision)
+            result = self._build_browse_options(main_product, main_decision, session_id)
         else:
-            return self._build_autonomous_order(
-                main_product, main_decision, addons_opted_in, addons_budget
+            result = self._build_autonomous_order(
+                main_product, main_decision, addons_opted_in, addons_budget, session_id
             )
 
-    def _build_browse_options(self, main_product, main_decision):
+        result["session_id"] = session_id
+        return result
+
+    def _build_browse_options(self, main_product, main_decision, session_id):
         """
         Human-Browse mode: gather everything the customer COULD choose,
         but don't finalize anything. No budget enforcement here — the
-        human sees real prices and decides for themselves (see README).
+        human sees real prices and decides for themselves.
         """
         from similar_items import decide_similar_items
+        from upsell_true import decide_upsell_upgrade
 
         upsell_result = decide_upsell_upgrade(main_product, self.all_products)
         complete_look_result = decide_complete_the_look(main_product, self.products_by_id)
         similar_result = decide_similar_items(main_product, self.all_products)
+
+        log_decision(
+            session_id=session_id,
+            decision_type="browse_options_generated",
+            product_ids=(
+                [upsell_result.get("suggested_product_id")] if upsell_result.get("should_suggest") else []
+            ) + complete_look_result["suggested_product_ids"] + similar_result["suggested_product_ids"],
+            reasoning="Options surfaced for human selection (browse mode) — not finalized.",
+            metadata={"mode": "browse"},
+        )
 
         return {
             "status": "awaiting_human_selection",
@@ -125,11 +153,13 @@ class PolicyEngine:
             "similar_items_options": similar_result,
         }
 
-    def _build_autonomous_order(self, main_product, main_decision, addons_opted_in, addons_budget):
+    def _build_autonomous_order(self, main_product, main_decision, addons_opted_in, addons_budget, session_id):
         """
         Fully-Autonomous mode: the engine decides everything itself,
         bounded by the customer's own stated budgets, then checks the
-        final total against the merchant-side approval-gate.
+        final total against the merchant-side approval-gate. Every
+        sub-decision and the final transaction outcome are logged, and a
+        successful order triggers the merchant-agent's demand re-evaluation.
         """
         order_items = [main_product]
         decision_log = [{
@@ -139,19 +169,13 @@ class PolicyEngine:
         }]
 
         # --- True Upsell: bounded by the CUSTOMER's own primary price
-        # ceiling (the price they searched under), not an internal
-        # multiplier. If the customer said "under 1000", an upgrade must
-        # also be under 1000 — we never spend more than what they asked
-        # for on the PRIMARY item, since upsell replaces it, not adds to it.
-        primary_budget_ceiling = main_product["price"]  # see note below
+        # ceiling, not an internal multiplier.
+        primary_budget_ceiling = main_product["price"]
         upgrade_candidates = find_upgrade_candidates(main_product, self.all_products)
-        # Re-filter candidates to respect the customer's own price ceiling
-        # rather than the module's default 3x sanity multiplier.
         upgrade_candidates = [c for c in upgrade_candidates if c["price"] <= primary_budget_ceiling]
 
         final_product = main_product
         if upgrade_candidates:
-            # Re-run the upsell decision using only budget-respecting candidates.
             upsell_result = self._decide_upgrade_from_candidates(main_product, upgrade_candidates)
             if upsell_result["should_suggest"]:
                 final_product = self.products_by_id[upsell_result["suggested_product_id"]]
@@ -161,6 +185,12 @@ class PolicyEngine:
                     "action": "true_upsell_applied",
                     "reasoning": upsell_result["reasoning"],
                 })
+                log_decision(
+                    session_id=session_id,
+                    decision_type="true_upsell",
+                    product_ids=[final_product["id"]],
+                    reasoning=upsell_result["reasoning"],
+                )
 
         # --- Complete the Look: only runs if the customer opted in,
         # bounded by their separately-stated addons_budget.
@@ -175,9 +205,6 @@ class PolicyEngine:
                 if running_total + product["price"] <= addons_budget:
                     accepted_addons.append(product)
                     running_total += product["price"]
-                # else: silently skip — code-level enforcement of the
-                # customer's stated addons budget, same safety-net pattern
-                # used throughout Phase 3.
 
             order_items.extend(accepted_addons)
             decision_log.append({
@@ -187,10 +214,18 @@ class PolicyEngine:
                 "addons_budget": addons_budget,
                 "addons_spent": running_total,
             })
+            log_decision(
+                session_id=session_id,
+                decision_type="complete_the_look",
+                product_ids=[p["id"] for p in accepted_addons],
+                reasoning=complete_look_result["reasoning"],
+                metadata={"addons_budget": addons_budget, "addons_spent": running_total},
+            )
 
+        # --- Approval gate: merchant-side bound, applies to the FINAL
+        # order total regardless of how it was assembled.
         order_total = sum(p["price"] for p in order_items)
         approval_threshold = self.policy["approval_gate"]["approval_required_above"]
-
         status = "pending_approval" if order_total > approval_threshold else "auto_approved"
 
         result = {
@@ -201,24 +236,8 @@ class PolicyEngine:
             "decision_log": decision_log,
         }
 
-        # Only create the actual Razorpay order once the agent has decided
-        # to proceed (auto_approved). A pending_approval order shouldn't
-        # exist in Razorpay yet — creating a real payable order before a
-        # human/merchant has approved it would defeat the point of the gate.
+        razorpay_order_id = None
         if status == "auto_approved":
-            import uuid
-            razorpay_order = create_order(
-                amount_rupees=order_total,
-                receipt_id=f"order_{uuid.uuid4().hex[:10]}",
-                notes={
-                    "item_ids": ",".join(p["id"] for p in order_items),
-                    "reasoning_summary": decision_log[0]["reasoning"][:500],  # Razorpay notes have a 256-char-per-field limit on some plans; truncate defensively
-                },
-            )
-            result["razorpay_order_id"] = razorpay_order["id"]
-            result["razorpay_key_id"] = os.environ["RAZORPAY_KEY_ID"]
-        if status == "auto_approved":
-            import uuid
             razorpay_order = create_order(
                 amount_rupees=order_total,
                 receipt_id=f"order_{uuid.uuid4().hex[:10]}",
@@ -229,12 +248,9 @@ class PolicyEngine:
             )
             result["razorpay_order_id"] = razorpay_order["id"]
             result["razorpay_key_id"] = os.environ["RAZORPAY_KEY_ID"]
+            razorpay_order_id = razorpay_order["id"]
 
-            # Feed the outcome back to the bandit: an auto-approved order
-            # means the buyer agent's product-selection led to a
-            # successfully-completed decision-flow (reward = success).
-            # This is what makes bandit_had_prior_learning eventually
-            # become True for categories with enough purchase history.
+            # Feed the outcome back to the bandit.
             main_item = order_items[0]
             same_category_products = [
                 p for p in self.all_products if p["category"] == main_item["category"]
@@ -247,7 +263,24 @@ class PolicyEngine:
                     reward=1.0,
                 )
 
-        
+        # Log the final transaction outcome regardless of status.
+        log_transaction(
+            session_id=session_id,
+            status=status,
+            order_total=order_total,
+            razorpay_order_id=razorpay_order_id,
+            item_ids=[p["id"] for p in order_items],
+            metadata={"approval_threshold": approval_threshold},
+        )
+
+        # After every successful transaction, let the merchant-agent
+        # re-evaluate demand and update its promotions — this closes the
+        # loop so the two agents interact autonomously, without needing
+        # a human to manually re-run the merchant-agent script.
+        if status == "auto_approved":
+            merchant_result = run_merchant_agent(session_id=session_id)
+            result["merchant_agent_promotions"] = merchant_result
+
         return result
 
     def _decide_upgrade_from_candidates(self, main_product, candidates):
@@ -299,33 +332,15 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("TEST 1: Autonomous mode, no add-ons opted in")
     result = engine.build_order("a formal shirt under 1000", mode="autonomous")
-    print(json.dumps({k: v for k, v in result.items() if k != "decision_log"}, indent=2, default=str))
-    print("Decision log:")
-    for entry in result.get("decision_log", []):
-        print(f"  {entry}")
-    print(f"Razorpay Order ID: {result.get('razorpay_order_id', 'N/A (not auto-approved)')}")
-    print("\n" + "=" * 60)
-    print("TEST 2: Autonomous mode, WITH add-ons opted in (budget: 500)")
-    result = engine.build_order(
-    "a formal shirt under 1000", mode="autonomous", addons_opted_in=True, addons_budget=1000
-)
-    
-    print(json.dumps({k: v for k, v in result.items() if k != "decision_log"}, indent=2, default=str))
-    print("Decision log:")
-    for entry in result.get("decision_log", []):
-        print(f"  {entry}")
-
-    print("\n" + "=" * 60)
-    print("TEST 3: Browse mode")
-    result = engine.build_order("a formal shirt under 1000", mode="browse")
-    print(f"Status: {result['status']}")
-    print(f"Main product: {result['main_product']['name']}")
-    print(f"Upsell option: {result['upsell_option']['should_suggest']}")
-    print(f"Complete-the-look options: {result['complete_the_look_options']['suggested_product_ids']}")
-    print(f"Similar items: {result['similar_items_options']['suggested_product_ids']}")
-
-    print("\n" + "=" * 60)
-    print("TEST 4: High-value item to trigger approval-gate")
-    result = engine.build_order("a watch above 10000", mode="autonomous")
+    print(f"Session ID: {result['session_id']}")
     print(f"Status: {result['status']}")
     print(f"Order total: ₹{result.get('order_total')}")
+    print(f"Merchant-agent promotions after this order: {result.get('merchant_agent_promotions', 'N/A (not auto_approved)')}")
+
+    print("\n" + "=" * 60)
+    print("Full audit trail for this session:")
+    sys.path.append(str(Path(__file__).parent.parent / "audit-service"))
+    from audit_db import get_session_history
+
+    history = get_session_history(result["session_id"])
+    print(json.dumps(history, indent=2))
