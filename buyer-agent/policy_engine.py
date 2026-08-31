@@ -11,8 +11,12 @@ logged to the SQLite audit trail, keyed by a per-purchase session_id.
 
 Phase 8 addition: after every successful (auto_approved) transaction, the
 merchant-side agent automatically re-evaluates demand and updates its
-promotions — this closes the multi-agent loop autonomously, without a
-human needing to manually re-run the merchant-agent script.
+promotions.
+
+Phase 9 addition: approve_pending_order() completes the loop for orders
+that were flagged pending_approval by the gate — a real gap fixed before
+this: previously the gate correctly PAUSED an order, but there was no
+code path to actually finish it after a human approved it.
 """
 
 import json
@@ -54,15 +58,6 @@ class PolicyEngine:
     merchant-side approval-gate. Every decision step is logged to the
     audit trail, and a successful order triggers the merchant-agent's
     own independent decision-cycle.
-
-    Usage:
-        engine = PolicyEngine()
-        order = engine.build_order(
-            query="a formal shirt under 1000",
-            mode="autonomous",
-            addons_opted_in=True,
-            addons_budget=500,
-        )
     """
 
     def __init__(self):
@@ -157,9 +152,7 @@ class PolicyEngine:
         """
         Fully-Autonomous mode: the engine decides everything itself,
         bounded by the customer's own stated budgets, then checks the
-        final total against the merchant-side approval-gate. Every
-        sub-decision and the final transaction outcome are logged, and a
-        successful order triggers the merchant-agent's demand re-evaluation.
+        final total against the merchant-side approval-gate.
         """
         order_items = [main_product]
         decision_log = [{
@@ -168,8 +161,6 @@ class PolicyEngine:
             "reasoning": main_decision["reasoning"],
         }]
 
-        # --- True Upsell: bounded by the CUSTOMER's own primary price
-        # ceiling, not an internal multiplier.
         primary_budget_ceiling = main_product["price"]
         upgrade_candidates = find_upgrade_candidates(main_product, self.all_products)
         upgrade_candidates = [c for c in upgrade_candidates if c["price"] <= primary_budget_ceiling]
@@ -192,8 +183,6 @@ class PolicyEngine:
                     reasoning=upsell_result["reasoning"],
                 )
 
-        # --- Complete the Look: only runs if the customer opted in,
-        # bounded by their separately-stated addons_budget.
         if addons_opted_in and addons_budget > 0:
             complete_look_result = decide_complete_the_look(final_product, self.products_by_id)
             addon_ids = complete_look_result["suggested_product_ids"]
@@ -222,8 +211,6 @@ class PolicyEngine:
                 metadata={"addons_budget": addons_budget, "addons_spent": running_total},
             )
 
-        # --- Approval gate: merchant-side bound, applies to the FINAL
-        # order total regardless of how it was assembled.
         order_total = sum(p["price"] for p in order_items)
         approval_threshold = self.policy["approval_gate"]["approval_required_above"]
         status = "pending_approval" if order_total > approval_threshold else "auto_approved"
@@ -250,7 +237,6 @@ class PolicyEngine:
             result["razorpay_key_id"] = os.environ["RAZORPAY_KEY_ID"]
             razorpay_order_id = razorpay_order["id"]
 
-            # Feed the outcome back to the bandit.
             main_item = order_items[0]
             same_category_products = [
                 p for p in self.all_products if p["category"] == main_item["category"]
@@ -263,7 +249,6 @@ class PolicyEngine:
                     reward=1.0,
                 )
 
-        # Log the final transaction outcome regardless of status.
         log_transaction(
             session_id=session_id,
             status=status,
@@ -273,15 +258,69 @@ class PolicyEngine:
             metadata={"approval_threshold": approval_threshold},
         )
 
-        # After every successful transaction, let the merchant-agent
-        # re-evaluate demand and update its promotions — this closes the
-        # loop so the two agents interact autonomously, without needing
-        # a human to manually re-run the merchant-agent script.
         if status == "auto_approved":
             merchant_result = run_merchant_agent(session_id=session_id)
             result["merchant_agent_promotions"] = merchant_result
 
         return result
+
+    def approve_pending_order(self, order_items, order_total, session_id):
+        """
+        Called after a human (merchant/customer) approves an order that
+        was previously flagged pending_approval by the approval-gate.
+        This completes exactly the same Razorpay-order-creation +
+        bandit-update + merchant-agent-trigger steps that auto_approved
+        orders go through automatically — the only difference is WHO
+        authorized it (a human, explicitly, rather than the policy
+        engine automatically).
+
+        This closes a real gap: previously, the gate correctly PAUSED a
+        high-value order (no Razorpay order was created, correctly), but
+        there was no code path to actually finish it afterward.
+        """
+        razorpay_order = create_order(
+            amount_rupees=order_total,
+            receipt_id=f"order_{uuid.uuid4().hex[:10]}",
+            notes={
+                "item_ids": ",".join(p["id"] for p in order_items),
+                "approval_type": "human_approved_after_gate",
+            },
+        )
+
+        main_item = order_items[0]
+        same_category_products = [
+            p for p in self.all_products if p["category"] == main_item["category"]
+        ]
+        if len(same_category_products) > 1:
+            self.buyer_agent.bandit.update(
+                chosen_product=main_item,
+                all_candidates=same_category_products,
+                category=main_item["category"],
+                reward=1.0,
+            )
+
+        log_decision(
+            session_id=session_id,
+            decision_type="human_approval",
+            product_ids=[p["id"] for p in order_items],
+            reasoning=f"Order for ₹{order_total} manually approved after exceeding the auto-approval threshold.",
+        )
+        log_transaction(
+            session_id=session_id,
+            status="approved_and_completed",
+            order_total=order_total,
+            razorpay_order_id=razorpay_order["id"],
+            item_ids=[p["id"] for p in order_items],
+        )
+
+        merchant_result = run_merchant_agent(session_id=session_id)
+
+        return {
+            "status": "approved_and_completed",
+            "razorpay_order_id": razorpay_order["id"],
+            "razorpay_key_id": os.environ["RAZORPAY_KEY_ID"],
+            "merchant_agent_promotions": merchant_result,
+        }
 
     def _decide_upgrade_from_candidates(self, main_product, candidates):
         """
@@ -335,12 +374,19 @@ if __name__ == "__main__":
     print(f"Session ID: {result['session_id']}")
     print(f"Status: {result['status']}")
     print(f"Order total: ₹{result.get('order_total')}")
-    print(f"Merchant-agent promotions after this order: {result.get('merchant_agent_promotions', 'N/A (not auto_approved)')}")
 
     print("\n" + "=" * 60)
-    print("Full audit trail for this session:")
-    sys.path.append(str(Path(__file__).parent.parent / "audit-service"))
-    from audit_db import get_session_history
+    print("TEST 5: High-value item -> pending_approval -> human APPROVES it")
+    result5 = engine.build_order("a watch above 10000", mode="autonomous")
+    print(f"Initial status: {result5['status']}")
 
-    history = get_session_history(result["session_id"])
-    print(json.dumps(history, indent=2))
+    if result5["status"] == "pending_approval":
+        approval_result = engine.approve_pending_order(
+            order_items=result5["order_items"],
+            order_total=result5["order_total"],
+            session_id=result5["session_id"],
+        )
+        print(f"After approval: {approval_result['status']}")
+        print(f"Razorpay Order ID: {approval_result['razorpay_order_id']}")
+    else:
+        print(f"(Query didn't trigger pending_approval — got '{result5['status']}' instead, skipping approval test)")
