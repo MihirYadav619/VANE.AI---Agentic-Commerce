@@ -2,20 +2,16 @@
 Phase 5 - Razorpay Integration: creates orders and verifies/captures
 payments in Razorpay's test mode.
 
-IMPORTANT CORRECTION: Razorpay does not allow creating a card payment
-directly from server-side code with raw card numbers — for PCI-DSS
-security reasons, actual payment collection must go through Razorpay's
-Checkout UI (browser-based), even in test mode. The server side only:
+IMPORTANT: Razorpay does not allow creating a card payment directly
+from server-side code with raw card numbers — for PCI-DSS security
+reasons, actual payment collection must go through Razorpay's Checkout
+UI (browser-based), even in test mode. The server side only:
   1. Creates the order (this file)
   2. Verifies the payment signature after Checkout completes (this file)
   3. Captures the payment if needed (this file)
-A minimal standalone HTML page (test_checkout.html) handles step 2's
-browser-side portion, using Razorpay's official test card numbers.
 """
 
 import os
-import hmac
-import hashlib
 from pathlib import Path
 
 import razorpay
@@ -34,11 +30,10 @@ def create_order(amount_rupees, receipt_id, notes=None):
     """
     Creates a Razorpay order. Amount must be in PAISE (₹1 = 100 paise).
     notes: optional dict of metadata (e.g. agent's reasoning) stored
-    alongside the order in Razorpay's own dashboard — useful for the
-    audit trail since it's visible directly in Razorpay's records.
+    alongside the order in Razorpay's own dashboard.
     """
     order_data = {
-        "amount": int(amount_rupees * 100),
+        "amount": int(round(amount_rupees * 100)),
         "currency": "INR",
         "receipt": receipt_id,
         "notes": notes or {},
@@ -51,8 +46,7 @@ def verify_payment_signature(order_id, payment_id, signature):
     After the customer completes payment via Checkout, Razorpay returns
     order_id + payment_id + signature to the browser. This function
     verifies that signature server-side to confirm the payment is
-    genuine and wasn't tampered with — this is a REQUIRED security step,
-    not optional, before trusting that a payment actually succeeded.
+    genuine and wasn't tampered with.
     """
     try:
         client.utility.verify_payment_signature({
@@ -87,6 +81,3 @@ if __name__ == "__main__":
     )
     print(f"Order created: {order['id']} for ₹{order['amount'] / 100}")
     print(f"\nKey ID for checkout: {RAZORPAY_KEY_ID}")
-    print("\nNow open test_checkout.html in a browser, paste this order_id")
-    print("and Key ID in, and complete a test payment using Razorpay's")
-    print("official test card: 4111 1111 1111 1111, any future expiry, any CVV.")

@@ -1,6 +1,42 @@
 {
+  "Boots": {
+    "discount_percentage": 2,
+    "reason": "3 purchases in the last 20 transactions (trending demand)."
+  },
   "Shirts": {
     "discount_percentage": 10,
-    "reason": "7 purchases in the last 20 transactions (trending demand)."
+    "reason": "9 purchases in the last 20 transactions (trending demand)."
+  },
+  "Watches": {
+    "discount_percentage": 10,
+    "reason": "11 purchases in the last 20 transactions (trending demand)."
+  },
+  "Sandals": {
+    "discount_percentage": 6,
+    "reason": "5 purchases in the last 20 transactions (trending demand)."
+  },
+  "Flats": {
+    "discount_percentage": 2,
+    "reason": "3 purchases in the last 20 transactions (trending demand)."
+  },
+  "Watch Gift Set": {
+    "discount_percentage": 2,
+    "reason": "3 purchases in the last 20 transactions (trending demand)."
+  },
+  "Palazzos": {
+    "discount_percentage": 4,
+    "reason": "4 purchases in the last 20 transactions (trending demand)."
+  },
+  "Sarees": {
+    "discount_percentage": 2,
+    "reason": "3 purchases in the last 20 transactions (trending demand)."
+  },
+  "Tshirts": {
+    "discount_percentage": 2,
+    "reason": "3 purchases in the last 20 transactions (trending demand)."
+  },
+  "Wallets": {
+    "discount_percentage": 2,
+    "reason": "3 purchases in the last 20 transactions (trending demand)."
   }
 }

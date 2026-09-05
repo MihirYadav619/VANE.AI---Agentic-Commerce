@@ -1,3 +1,6 @@
+# ============================================================
+# complete_the_look.py
+# ============================================================
 """
 Phase 3 - Step 2 (revised): "Complete the Look" — multi-item complementary
 suggestions with priority-ranking.
@@ -20,6 +23,29 @@ Key design decisions (from testing/debugging):
 
 import json
 import os
+import re
+import time
+
+def detect_gender(product_name):
+    """
+    Code-level gender safety-net: even though the LLM usually catches
+    gender-mismatched pairings on its own (e.g. a women's item suggested
+    alongside men's trousers), it isn't 100% reliable — we've seen similar
+    LLM-judgment misses before (e.g. price-arithmetic errors in earlier
+    testing). This deterministically filters candidates BEFORE they even
+    reach the LLM, guaranteeing gender-consistency rather than merely
+    hoping the LLM's own reasoning catches it every time.
+    """
+    name_lower = product_name.lower()
+    if re.search(r"\bmen\b", name_lower) and "women" not in name_lower:
+        return "men"
+    if "women" in name_lower:
+        return "women"
+    if re.search(r"\bboys?\b", name_lower):
+        return "boys"
+    if re.search(r"\bgirls?\b", name_lower):
+        return "girls"
+    return "unisex"
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -27,13 +53,34 @@ from dotenv import load_dotenv
 ENV_PATH = Path(__file__).parent.parent / "backend" / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-try:
-    from mistralai.client import Mistral
-except ImportError:
-    from mistralai import Mistral
+from groq import Groq, BadRequestError
 
-MODEL_NAME = "mistral-small-2603"
-client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
+MODEL_NAME = "openai/gpt-oss-20b"
+client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+
+def call_llm_with_retry(max_retries=2, **kwargs):
+    """
+    Wraps client.chat.completions.create() with a retry for the
+    occasional "tool_use_failed" / malformed-JSON error some models
+    (notably GPT-OSS) can produce on longer reasoning fields — this is
+    the exact failure this module hit in testing. A small non-zero
+    temperature (set by the caller) matters here: at temperature=0 the
+    model can regenerate the EXACT same broken output on every retry,
+    since there's no randomness to produce a different (hopefully valid)
+    generation the second time around.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except BadRequestError as e:
+            is_json_failure = "tool_use_failed" in str(e) or "Failed to parse tool call arguments" in str(e)
+            if is_json_failure and attempt < max_retries:
+                print(f"[complete_the_look] Tool-call JSON parse failed, retrying (attempt {attempt + 1})...")
+                time.sleep(0.5)
+                continue
+            raise
+
 
 MAX_SANITY_PRICE_MULTIPLIER = 5.0
 
@@ -120,21 +167,32 @@ Rules you must follow:
 4. A candidate priced noticeably higher than the main item can still be a
    reasonable suggestion, as long as the combination feels like a normal
    purchase. Only reject on price grounds if the jump seems absurd.
-5. Keep your reasoning concise but cover every candidate you were given.
-6. You must call the record_complete_the_look_decision tool exactly once."""
+5. Keep your reasoning CONCISE — 2-4 short sentences total covering all
+   candidates together. Do not write a separate detailed paragraph per
+   candidate; summarize your overall picks and the one-line reason for
+   each in a single compact block.
+6. Use plain ASCII punctuation only in your reasoning — regular hyphens
+   (-) and straight quotes ('  "), never typographic dashes, curly/smart
+   quotes, or other special Unicode punctuation. This keeps your output
+   valid, parseable JSON.
+7. You must call the record_complete_the_look_decision tool exactly once."""
 
 
 def get_sane_candidates(main_product, catalog_products_by_id):
     candidate_ids = main_product.get("complementary_items", [])
+    main_gender = main_product.get("gender", "unisex")
     candidates = []
     for cid in candidate_ids:
         c = catalog_products_by_id.get(cid)
-        if c is None:
-            continue
-        if c["stock"] == 0:
+        if c is None or c["stock"] == 0:
             continue
         if c["price"] > main_product["price"] * MAX_SANITY_PRICE_MULTIPLIER:
             continue
+
+        candidate_gender = c.get("gender", "unisex")
+        if main_gender != "unisex" and candidate_gender != "unisex" and candidate_gender != main_gender:
+            continue
+
         candidates.append(c)
     return candidates
 
@@ -159,18 +217,20 @@ def decide_complete_the_look(main_product, catalog_products_by_id):
         f"Main product being purchased: {main_product['name']} "
         f"(category: {main_product['category']}, price: ₹{main_product['price']})\n\n"
         f"Candidate complementary items:\n{candidate_lines}\n\n"
-        f"Decide which of these (if any) to suggest as add-ons, ranked by priority. Remember: at most ONE per slot."
+        f"Decide which of these (if any) to suggest as add-ons, ranked by priority. Remember: at most ONE per slot. "
+        f"Keep your reasoning brief and use plain ASCII punctuation only."
     )
 
-    response = client.chat.complete(
+    response = call_llm_with_retry(
         model=MODEL_NAME,
         messages=[
             {"role": "system", "content": COMPLETE_LOOK_SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
         ],
         tools=[COMPLETE_LOOK_TOOL],
-        tool_choice="any",
-        max_tokens=1000,
+        tool_choice="required",
+        temperature=0.3,
+        max_tokens=1500,
     )
 
     tool_call = response.choices[0].message.tool_calls[0]

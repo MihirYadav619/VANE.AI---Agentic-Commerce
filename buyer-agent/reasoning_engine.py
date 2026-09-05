@@ -1,3 +1,6 @@
+# ============================================================
+# reasoning_engine.py
+# ============================================================
 """
 Phase 3 - Step 1 (revised for Phase 6/7): Core buyer-agent reasoning with
 LinUCB bandit refinement and merchant-agent promotion-awareness.
@@ -23,6 +26,7 @@ through a shared, auditable signal (not a hardcoded coupling).
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,10 +34,7 @@ from dotenv import load_dotenv
 ENV_PATH = Path(__file__).parent.parent / "backend" / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-try:
-    from mistralai.client import Mistral
-except ImportError:
-    from mistralai import Mistral
+from groq import Groq, BadRequestError
 
 sys.path.append(str(Path(__file__).parent.parent / "catalog-service"))
 sys.path.append(str(Path(__file__).parent))
@@ -42,10 +43,32 @@ from hybrid_search import HybridSearch
 from bandit import LinUCBBandit
 from merchant_agent import get_active_promotions
 
-MODEL_NAME = "mistral-small-2603"
+MODEL_NAME = "openai/gpt-oss-120b"
 NUM_CANDIDATES_TO_SHOW_LLM = 8
 
-client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
+client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+
+def call_llm_with_retry(max_retries=2, **kwargs):
+    """
+    Wraps client.chat.completions.create() with a retry for the
+    occasional "tool_use_failed" / malformed-JSON error some models
+    (notably GPT-OSS) can produce on longer reasoning fields. A small
+    non-zero temperature (set by the caller) matters here: at
+    temperature=0 the model can regenerate the EXACT same broken output
+    on every retry, since there's no randomness to produce a different
+    (hopefully valid) generation the second time around.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except BadRequestError as e:
+            is_json_failure = "tool_use_failed" in str(e) or "Failed to parse tool call arguments" in str(e)
+            if is_json_failure and attempt < max_retries:
+                print(f"[reasoning_engine] Tool-call JSON parse failed, retrying (attempt {attempt + 1})...")
+                time.sleep(0.5)
+                continue
+            raise
 
 
 def build_candidate_summary(products):
@@ -123,7 +146,11 @@ Rules you must follow:
    honestly say no good match exists than to force a bad recommendation — \
    but do not reject candidates over constraints the user never actually stated.
 4. Keep your reasoning concise (1-3 sentences) and concrete.
-5. You must call the record_decision tool exactly once with your answer."""
+5. Use plain ASCII punctuation only in your reasoning — regular hyphens (-) \
+   and straight quotes ('  "), never typographic dashes, curly/smart quotes, \
+   or other special Unicode punctuation. This keeps your output valid, \
+   parseable JSON.
+6. You must call the record_decision tool exactly once with your answer."""
 
 
 class BuyerAgent:
@@ -177,17 +204,20 @@ class BuyerAgent:
             f"Candidate products (from catalog search):\n{candidate_text}"
             f"{promotion_note}\n\n"
             f"Decide which candidate (if any) genuinely matches the user's request. "
-            f"If a promotion applies to the category of your chosen candidate, mention it in your reasoning."
+            f"If a promotion applies to the category of your chosen candidate, mention it in your reasoning. "
+            f"Use plain ASCII punctuation only."
         )
 
-        response = client.chat.complete(
+        response = call_llm_with_retry(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
             tools=[REASONING_TOOL],
-            tool_choice="any",
+            tool_choice="required",
+            temperature=0.3,
+            max_tokens=1500,
         )
 
         tool_call = response.choices[0].message.tool_calls[0]

@@ -86,7 +86,30 @@ def detect_gender(product_name):
         return "girls"
     return "unisex"
 
-
+def get_gender_from_breadcrumb(breadcrumb_str):
+    """
+    More reliable than parsing the product NAME — Myntra's breadcrumb
+    hierarchy consistently states gender near the top (e.g. "Men >
+    Clothing > Topwear"), whereas titles often omit it entirely when
+    implied by category (e.g. "Styli Pink Mandarin Collar Lace Insert
+    Top" never says "Women", causing name-based detection to default it
+    to "unisex" and incorrectly let it pass a gender-mismatch filter).
+    """
+    try:
+        crumbs = json.loads(breadcrumb_str)
+        names = [c["name"].lower() for c in crumbs]
+        joined = " ".join(names[:2])
+        if "women" in joined:
+            return "women"
+        if "men" in joined:
+            return "men"
+        if "boys" in joined:
+            return "boys"
+        if "girls" in joined:
+            return "girls"
+    except Exception:
+        pass
+    return None
 # Brand/store names that got mistakenly captured as "category" during
 # scraping (breadcrumb depth was inconsistent for these rows) — not real
 # product categories, so they're excluded.
@@ -171,7 +194,7 @@ def build_catalog():
             "description": clean_text(row["product_description"], 200),
             "image_url": first_image(row["images"]),
             "_group": CATEGORY_GROUP.get(row["sub_category"], "misc"),
-            "_gender": detect_gender(name),
+            "gender": get_gender_from_breadcrumb(row["breadcrumbs"]) or detect_gender(name),
         })
 
     # Fix zero/missing ratings -> assign a realistic value instead of 0.0,
@@ -215,12 +238,12 @@ def build_catalog():
             if not pool:
                 continue
 
-            if p["_gender"] == "unisex":
+            if p["gender"] == "unisex":
                 chosen_pool = pool
             else:
                 same_gender_pool = [
                     pid for pid in pool
-                    if products_by_id[pid]["_gender"] in (p["_gender"], "unisex")
+                    if products_by_id[pid]["gender"] in (p["gender"], "unisex")
                 ]
                 chosen_pool = same_gender_pool if same_gender_pool else pool
 
@@ -236,7 +259,6 @@ def build_catalog():
     # an EARLIER product's _gender/_group as a candidate.
     for p in products:
         del p["_group"]
-        del p["_gender"]
 
     return products
 

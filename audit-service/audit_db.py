@@ -129,7 +129,14 @@ def get_recent_activity(limit=20):
     ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
-
+def get_recent_transactions(limit=10):
+    """Fetches the most recent transactions (orders), for a 'Recent Orders' UI panel."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM transactions ORDER BY timestamp DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 if __name__ == "__main__":
     init_db()

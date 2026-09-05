@@ -1,3 +1,6 @@
+# ============================================================
+# upsell_true.py
+# ============================================================
 """
 Phase 3 - Step 2a: True upsell reasoning.
 
@@ -11,6 +14,7 @@ same-category replacement for the item the customer already chose.
 
 import json
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -18,13 +22,33 @@ from dotenv import load_dotenv
 ENV_PATH = Path(__file__).parent.parent / "backend" / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-try:
-    from mistralai.client import Mistral
-except ImportError:
-    from mistralai import Mistral
+from groq import Groq, BadRequestError
 
-MODEL_NAME = "mistral-small-2603"
-client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
+MODEL_NAME = "openai/gpt-oss-20b"
+client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+
+def call_llm_with_retry(max_retries=2, **kwargs):
+    """
+    Wraps client.chat.completions.create() with a retry for the
+    occasional "tool_use_failed" / malformed-JSON error some models
+    (notably GPT-OSS) can produce on longer reasoning fields. A small
+    non-zero temperature (set by the caller) matters here: at
+    temperature=0 the model can regenerate the EXACT same broken output
+    on every retry, since there's no randomness to produce a different
+    (hopefully valid) generation the second time around.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except BadRequestError as e:
+            is_json_failure = "tool_use_failed" in str(e) or "Failed to parse tool call arguments" in str(e)
+            if is_json_failure and attempt < max_retries:
+                print(f"[upsell_true] Tool-call JSON parse failed, retrying (attempt {attempt + 1})...")
+                time.sleep(0.5)
+                continue
+            raise
+
 
 # Sanity-check cap: an upgrade suggestion is only ever reasonable up to this
 # multiple of the original item's price. This exists purely to block absurd
@@ -105,7 +129,11 @@ Rules you must follow:
 3. If no candidate offers a genuinely compelling upgrade, set should_suggest
    to false. Do not force an upgrade suggestion just because candidates exist.
 4. Keep your reasoning concise (1-2 sentences).
-5. You must call the record_upgrade_decision tool exactly once."""
+5. Use plain ASCII punctuation only in your reasoning — regular hyphens (-)
+   and straight quotes ('  "), never typographic dashes, curly/smart quotes,
+   or other special Unicode punctuation. This keeps your output valid,
+   parseable JSON.
+6. You must call the record_upgrade_decision tool exactly once."""
 
 
 def decide_upsell_upgrade(main_product, all_products):
@@ -132,17 +160,20 @@ def decide_upsell_upgrade(main_product, all_products):
         f"Customer selected: {main_product['name']} "
         f"(price: ₹{main_product['price']}, rating: {main_product['rating']})\n\n"
         f"Candidate upgrades (same category, priced higher):\n{candidate_lines}\n\n"
-        f"Decide whether any of these is a genuinely worthwhile upgrade to suggest."
+        f"Decide whether any of these is a genuinely worthwhile upgrade to suggest. "
+        f"Use plain ASCII punctuation only."
     )
 
-    response = client.chat.complete(
+    response = call_llm_with_retry(
         model=MODEL_NAME,
         messages=[
             {"role": "system", "content": UPGRADE_SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
         ],
         tools=[UPGRADE_TOOL],
-        tool_choice="any",
+        tool_choice="required",
+        temperature=0.3,
+        max_tokens=1200,
     )
 
     tool_call = response.choices[0].message.tool_calls[0]

@@ -1,3 +1,6 @@
+# ============================================================
+# similar_items.py
+# ============================================================
 """
 Phase 3 - Step 2c: "Similar Items" — same-category alternatives at a
 comparable price point.
@@ -12,6 +15,7 @@ t-shirt style in a different color, or a comparable alternative brand).
 
 import json
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,13 +23,33 @@ from dotenv import load_dotenv
 ENV_PATH = Path(__file__).parent.parent / "backend" / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-try:
-    from mistralai.client import Mistral
-except ImportError:
-    from mistralai import Mistral
+from groq import Groq, BadRequestError
 
-MODEL_NAME = "mistral-small-2603"
-client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
+MODEL_NAME = "openai/gpt-oss-20b"
+client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+
+def call_llm_with_retry(max_retries=2, **kwargs):
+    """
+    Wraps client.chat.completions.create() with a retry for the
+    occasional "tool_use_failed" / malformed-JSON error some models
+    (notably GPT-OSS) can produce on longer reasoning fields. A small
+    non-zero temperature (set by the caller) matters here: at
+    temperature=0 the model can regenerate the EXACT same broken output
+    on every retry, since there's no randomness to produce a different
+    (hopefully valid) generation the second time around.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except BadRequestError as e:
+            is_json_failure = "tool_use_failed" in str(e) or "Failed to parse tool call arguments" in str(e)
+            if is_json_failure and attempt < max_retries:
+                print(f"[similar_items] Tool-call JSON parse failed, retrying (attempt {attempt + 1})...")
+                time.sleep(0.5)
+                continue
+            raise
+
 
 # "Similar" price band — not premium (that's upsell_true.py's job), just
 # roughly comparable so the alternative doesn't feel like a mismatched
@@ -96,8 +120,13 @@ Rules you must follow:
    choice without overwhelming the customer.
 3. If none of the candidates offer genuine variety or value, return an
    empty list. Do not suggest alternatives just to fill a quota.
-4. Keep your reasoning concise but cover your decision for each candidate.
-5. You must call the record_similar_items_decision tool exactly once."""
+4. Keep your reasoning concise but cover your decision for each candidate
+   briefly — a short sentence per point, not a long paragraph.
+5. Use plain ASCII punctuation only in your reasoning — regular hyphens (-)
+   and straight quotes ('  "), never typographic dashes, curly/smart quotes,
+   or other special Unicode punctuation. This keeps your output valid,
+   parseable JSON.
+6. You must call the record_similar_items_decision tool exactly once."""
 
 
 def decide_similar_items(main_product, all_products):
@@ -118,18 +147,20 @@ def decide_similar_items(main_product, all_products):
         f"Customer is looking at: {main_product['name']} "
         f"(price: ₹{main_product['price']}, rating: {main_product['rating']})\n\n"
         f"Similar-category alternatives:\n{candidate_lines}\n\n"
-        f"Decide which (if any) offer genuine worthwhile variety to show."
+        f"Decide which (if any) offer genuine worthwhile variety to show. "
+        f"Use plain ASCII punctuation only."
     )
 
-    response = client.chat.complete(
+    response = call_llm_with_retry(
         model=MODEL_NAME,
         messages=[
             {"role": "system", "content": SIMILAR_ITEMS_SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
         ],
         tools=[SIMILAR_ITEMS_TOOL],
-        tool_choice="any",
-        max_tokens=800,
+        tool_choice="required",
+        temperature=0.3,
+        max_tokens=1200,
     )
 
     tool_call = response.choices[0].message.tool_calls[0]

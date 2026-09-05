@@ -3,20 +3,23 @@ Phase 4 - Policy Engine: orchestrates the full buyer-agent pipeline
 (product selection -> upsell/cross-sell -> approval-gate check) according
 to the customer's chosen mode and stated budgets.
 
-Phase 6 addition: bandit-based product-selection refinement, with
-reward-feedback wired here.
+Phase 6: bandit-based product-selection refinement, with reward-feedback
+wired here.
 
-Phase 7 addition: every decision and the final transaction outcome are
-logged to the SQLite audit trail, keyed by a per-purchase session_id.
+Phase 7: every decision and the final transaction outcome are logged to
+the SQLite audit trail, keyed by a per-purchase session_id.
 
-Phase 8 addition: after every successful (auto_approved) transaction, the
+Phase 8: after every successful (auto_approved) transaction, the
 merchant-side agent automatically re-evaluates demand and updates its
 promotions.
 
-Phase 9 addition: approve_pending_order() completes the loop for orders
-that were flagged pending_approval by the gate — a real gap fixed before
-this: previously the gate correctly PAUSED an order, but there was no
-code path to actually finish it after a human approved it.
+Phase 9: approve_pending_order() completes the loop for orders that were
+flagged pending_approval by the gate.
+
+Phase 10: finalize_selection() completes the loop for Human-Browse mode
+single-search selections. checkout_cart() generalizes this further to
+support a CART — an arbitrary list of products accumulated across
+MULTIPLE separate searches, checked out together in one transaction.
 """
 
 import json
@@ -119,8 +122,8 @@ class PolicyEngine:
     def _build_browse_options(self, main_product, main_decision, session_id):
         """
         Human-Browse mode: gather everything the customer COULD choose,
-        but don't finalize anything. No budget enforcement here — the
-        human sees real prices and decides for themselves.
+        but don't finalize anything. Full product details (not just IDs)
+        are attached so the frontend can render everything directly.
         """
         from similar_items import decide_similar_items
         from upsell_true import decide_upsell_upgrade
@@ -128,6 +131,19 @@ class PolicyEngine:
         upsell_result = decide_upsell_upgrade(main_product, self.all_products)
         complete_look_result = decide_complete_the_look(main_product, self.products_by_id)
         similar_result = decide_similar_items(main_product, self.all_products)
+
+        upsell_product = None
+        if upsell_result.get("should_suggest") and upsell_result.get("suggested_product_id"):
+            upsell_product = self.products_by_id.get(upsell_result["suggested_product_id"])
+
+        complete_look_products = [
+            self.products_by_id[pid] for pid in complete_look_result["suggested_product_ids"]
+            if pid in self.products_by_id
+        ]
+        similar_products = [
+            self.products_by_id[pid] for pid in similar_result["suggested_product_ids"]
+            if pid in self.products_by_id
+        ]
 
         log_decision(
             session_id=session_id,
@@ -144,8 +160,11 @@ class PolicyEngine:
             "main_product": main_product,
             "main_product_reasoning": main_decision["reasoning"],
             "upsell_option": upsell_result,
+            "upsell_product": upsell_product,
             "complete_the_look_options": complete_look_result,
+            "complete_the_look_products": complete_look_products,
             "similar_items_options": similar_result,
+            "similar_items_products": similar_products,
         }
 
     def _build_autonomous_order(self, main_product, main_decision, addons_opted_in, addons_budget, session_id):
@@ -268,15 +287,6 @@ class PolicyEngine:
         """
         Called after a human (merchant/customer) approves an order that
         was previously flagged pending_approval by the approval-gate.
-        This completes exactly the same Razorpay-order-creation +
-        bandit-update + merchant-agent-trigger steps that auto_approved
-        orders go through automatically — the only difference is WHO
-        authorized it (a human, explicitly, rather than the policy
-        engine automatically).
-
-        This closes a real gap: previously, the gate correctly PAUSED a
-        high-value order (no Razorpay order was created, correctly), but
-        there was no code path to actually finish it afterward.
         """
         razorpay_order = create_order(
             amount_rupees=order_total,
@@ -322,6 +332,114 @@ class PolicyEngine:
             "merchant_agent_promotions": merchant_result,
         }
 
+    def finalize_selection(self, main_product_id, addon_ids, session_id):
+        """
+        Called when a customer in Human-Browse mode has finished manually
+        selecting items from a SINGLE search (a main product + any chosen
+        add-ons/similar-items). Kept for backward compatibility / simple
+        single-search checkouts — checkout_cart() below is the more
+        general version used for multi-search carts.
+        """
+        main_product = self.products_by_id[main_product_id]
+        addon_products = [self.products_by_id[pid] for pid in addon_ids if pid in self.products_by_id]
+        order_items = [main_product] + addon_products
+        return self._checkout_items(order_items, session_id, decision_type="human_selection_finalized")
+
+    def checkout_cart(self, product_ids, session_id):
+        """
+        Checks out an arbitrary list of products accumulated across
+        potentially MULTIPLE separate searches (Browse mode's cart) —
+        unlike finalize_selection(), which is scoped to one search's
+        main-item + its suggested add-ons, this accepts any product-id
+        list the customer built up over time by clicking "Add to Cart"
+        on different, possibly-unrelated searches.
+        """
+        order_items = [self.products_by_id[pid] for pid in product_ids if pid in self.products_by_id]
+
+        if not order_items:
+            return {"status": "error", "reasoning": "Cart is empty or contains invalid product ids."}
+
+        return self._checkout_items(order_items, session_id, decision_type="cart_checkout")
+
+    def _checkout_items(self, order_items, session_id, decision_type):
+        """
+        Shared checkout logic used by both finalize_selection() and
+        checkout_cart(): compute total, check the approval-gate, create
+        the Razorpay order if auto-approved, feed the bandit for every
+        distinct category represented, log everything, and trigger the
+        merchant-agent.
+        """
+        order_total = sum(p["price"] for p in order_items)
+        approval_threshold = self.policy["approval_gate"]["approval_required_above"]
+        status = "pending_approval" if order_total > approval_threshold else "auto_approved"
+
+        log_decision(
+            session_id=session_id,
+            decision_type=decision_type,
+            product_ids=[p["id"] for p in order_items],
+            reasoning=f"Customer manually selected/checked-out {len(order_items)} item(s).",
+        )
+
+        if status == "auto_approved":
+            razorpay_order = create_order(
+                amount_rupees=order_total,
+                receipt_id=f"order_{uuid.uuid4().hex[:10]}",
+                notes={
+                    "item_ids": ",".join(p["id"] for p in order_items),
+                    "mode": decision_type,
+                },
+            )
+
+            categories_seen = set()
+            for item in order_items:
+                if item["category"] in categories_seen:
+                    continue
+                categories_seen.add(item["category"])
+                same_category_products = [
+                    p for p in self.all_products if p["category"] == item["category"]
+                ]
+                if len(same_category_products) > 1:
+                    self.buyer_agent.bandit.update(
+                        chosen_product=item,
+                        all_candidates=same_category_products,
+                        category=item["category"],
+                        reward=1.0,
+                    )
+
+            log_transaction(
+                session_id=session_id,
+                status=status,
+                order_total=order_total,
+                razorpay_order_id=razorpay_order["id"],
+                item_ids=[p["id"] for p in order_items],
+            )
+            merchant_result = run_merchant_agent(session_id=session_id)
+
+            return {
+                "status": status,
+                "order_items": order_items,
+                "order_total": order_total,
+                "razorpay_order_id": razorpay_order["id"],
+                "razorpay_key_id": os.environ["RAZORPAY_KEY_ID"],
+                "session_id": session_id,
+                "merchant_agent_promotions": merchant_result,
+            }
+        else:
+            log_transaction(
+                session_id=session_id,
+                status=status,
+                order_total=order_total,
+                razorpay_order_id=None,
+                item_ids=[p["id"] for p in order_items],
+            )
+            return {
+                "status": status,
+                "order_items": order_items,
+                "order_total": order_total,
+                "approval_threshold": approval_threshold,
+                "session_id": session_id,
+            }
+
     def _decide_upgrade_from_candidates(self, main_product, candidates):
         """
         Thin wrapper: reuses upsell_true.py's LLM-decision logic but with
@@ -344,14 +462,16 @@ class PolicyEngine:
             f"Decide whether any of these is a genuinely worthwhile upgrade to suggest."
         )
 
-        response = ut.client.chat.complete(
+        response = ut.call_llm_with_retry(
             model=ut.MODEL_NAME,
             messages=[
                 {"role": "system", "content": ut.UPGRADE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
             tools=[ut.UPGRADE_TOOL],
-            tool_choice="any",
+            tool_choice="required",
+            temperature=0.3,
+            max_tokens=1200,
         )
         tool_call = response.choices[0].message.tool_calls[0]
         decision = json.loads(tool_call.function.arguments)
@@ -369,24 +489,11 @@ if __name__ == "__main__":
     engine = PolicyEngine()
 
     print("\n" + "=" * 60)
-    print("TEST 1: Autonomous mode, no add-ons opted in")
-    result = engine.build_order("a formal shirt under 1000", mode="autonomous")
-    print(f"Session ID: {result['session_id']}")
+    print("TEST: Cart checkout with multiple unrelated items")
+    result = engine.checkout_cart(
+        product_ids=["M0244", "M0401"],
+        session_id=f"cart_test_{uuid.uuid4().hex[:8]}",
+    )
     print(f"Status: {result['status']}")
-    print(f"Order total: ₹{result.get('order_total')}")
-
-    print("\n" + "=" * 60)
-    print("TEST 5: High-value item -> pending_approval -> human APPROVES it")
-    result5 = engine.build_order("a watch above 10000", mode="autonomous")
-    print(f"Initial status: {result5['status']}")
-
-    if result5["status"] == "pending_approval":
-        approval_result = engine.approve_pending_order(
-            order_items=result5["order_items"],
-            order_total=result5["order_total"],
-            session_id=result5["session_id"],
-        )
-        print(f"After approval: {approval_result['status']}")
-        print(f"Razorpay Order ID: {approval_result['razorpay_order_id']}")
-    else:
-        print(f"(Query didn't trigger pending_approval — got '{result5['status']}' instead, skipping approval test)")
+    print(f"Order total: ₹{result['order_total']}")
+    print(f"Items: {[item['name'] for item in result['order_items']]}")
