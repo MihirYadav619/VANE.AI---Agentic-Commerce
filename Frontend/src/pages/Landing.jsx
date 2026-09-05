@@ -20,8 +20,17 @@ export default function Landing() {
       {/* ============ TOP NAV ============ */}
       <div className="absolute top-0 left-0 right-0 z-20 flex justify-between items-center px-8 py-6">
         <h1 className="font-serif italic text-xl tracking-wide">vane.ai</h1>
-        <div className="flex items-center gap-5 text-sm text-white/80">
-          <button onClick={() => navigate("/login")} className="hover:text-white transition-colors">
+        <div className="flex items-center gap-3 text-sm text-white/80">
+          <button
+            onClick={() => navigate("/merchant-login")}
+            className="border border-white/25 text-white/70 hover:text-white hover:border-white/50 px-5 py-2 rounded-full text-sm font-medium transition-colors"
+          >
+            Merchant
+          </button>
+          <button
+            onClick={() => navigate("/login")}
+            className="border border-white/25 text-white/70 hover:text-white hover:border-white/50 px-5 py-2 rounded-full text-sm font-medium transition-colors"
+          >
             Log in
           </button>
           <button

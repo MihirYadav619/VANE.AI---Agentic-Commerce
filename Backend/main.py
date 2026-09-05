@@ -19,10 +19,12 @@ from auth import init_auth_db, create_user, authenticate_user, create_session, g
 
 sys.path.insert(0, str(PROJECT_ROOT / "buyer-agent"))
 sys.path.insert(0, str(PROJECT_ROOT / "audit-service"))
+sys.path.insert(0, str(PROJECT_ROOT / "merchant-agent"))
 
 from policy_engine import PolicyEngine
 from cart_nudge import get_cart_nudge
 from audit_db import get_recent_activity, get_session_history, get_recent_transactions
+from merchant_agent import get_active_promotions
 
 CATALOG_PATH = BASE_DIR / "data" / "catalog.json"
 POLICY_PATH = BASE_DIR / "data" / "policy.json"
@@ -184,6 +186,20 @@ def get_audit_session(session_id: str):
 @app.get("/audit/recent-orders")
 def get_recent_orders(limit: int = 10):
     return get_recent_transactions(limit=limit)
+
+
+# ---------- Merchant ----------
+
+@app.get("/merchant/promotions")
+def get_merchant_promotions():
+    """
+    Surfaces the merchant-agent's currently active category promotions —
+    e.g. {"Palazzos": {"discount_percentage": 4, "reason": "..."}}.
+    Read-only: the merchant-agent updates these itself internally after
+    each auto-approved transaction (see run_merchant_agent() in
+    policy_engine.py); this endpoint doesn't trigger a recalculation.
+    """
+    return get_active_promotions()
 
 
 if __name__ == "__main__":

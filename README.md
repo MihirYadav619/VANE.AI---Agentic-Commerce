@@ -1,250 +1,201 @@
-# Agentic Commerce — Razorpay Buildathon (Track 01: AI Growth & Agentic Commerce)
+# Vane.ai — Agentic Commerce
 
-An AI buyer agent that autonomously shops a merchant's catalog and completes
-payments via Razorpay test-mode APIs — with every money action explainable,
-bounded, gated, and audited. A second, independent merchant-side agent
-makes this a genuine multi-agent system, not just a single bot.
+**An agent that shops — on your terms. And a merchant that grows its own revenue — on its own.**
 
----
-
-## Project Goals
-
-### Core Goals
-- [x] Agent-readable catalog (897 products, machine-queryable)
-- [x] Hybrid retrieval (FAISS + BM25 + RRF)
-- [x] AI buyer agent with explainable, honest reasoning
-- [x] Purchase execution end-to-end (Razorpay Orders + Checkout + signature verification)
-- [x] Multiple revenue-growth mechanisms (Upsell, Complete-the-Look, Similar Items, Cart-Nudge)
-- [x] Policy/guardrail engine (customer-budgets + merchant-side caps)
-- [x] Approval gate (order-total-based)
-- [x] Real Razorpay test-mode integration
-- [x] **Audit trail** — SQLite-backed, every decision + transaction logged and queryable
-- [ ] At least one graceful failure (Phase 9)
-
-### Additional Goals
-- [x] **Bandit algorithm (LinUCB)** — see Phase 6, including a real
-      cold-start safety-mechanism discovered and fixed during testing.
-- [ ] Multiple failure scenarios (5, not just 1) — including
-      **prompt-injection resistance** (Phase 9).
-- [ ] Measured retrieval quality metric.
-- [x] **Second agent for a true multi-agent demo** — see Phase 7/8 below.
-      A genuinely independent merchant-side agent, communicating with the
-      buyer-agent through a shared, auditable signal.
-5. UI/UX deep polish (Phase 10).
-
-**Checkpoint (completed after Phase 5):** On-time. Proceeding with the
-full additional-goals list.
+Vane.ai is a full-stack agentic commerce platform: an AI buyer-agent that can autonomously discover, decide, and purchase on a merchant's catalog end to end, and an independent merchant-agent that grows revenue by reacting to real demand — all running on Razorpay's payment infrastructure, with every money-moving action explainable, bounded, and gated.
 
 ---
 
-## Progress Log
+## Design principle: every money action is explainable, bounded, and gated
 
-*(Phases 1-6 unchanged from previous version — see prior sections: real
-Myntra catalog, hybrid retrieval with RRF, four revenue mechanisms,
-policy engine with two purchase modes, Razorpay integration, and the
-LinUCB bandit with its cold-start safety-mechanism fix.)*
+This is the core constraint the entire system is built around, not an afterthought:
 
-### Phase 7 — Audit Trail + Merchant-Agent Foundation ✅
-
-**Audit Trail** (`audit-service/audit_db.py`): SQLite database with two
-tables — `decisions` (every reasoning-step: main selection, true upsell,
-complete-the-look, merchant promotions) and `transactions` (final order
-outcomes) — grouped by a per-purchase `session_id` so a complete decision
-history can be traced for any transaction. This is what makes the system
-genuinely auditable, not just "explainable in the moment" via a printed
-string that disappears when the script exits.
-
-**Merchant-Agent** (`merchant-agent/merchant_agent.py`) — the system's
-**second, independent agent**, directly addressing the "Agentic" half of
-the track name (most teams build only a single buyer-bot). It thinks from
-the *merchant's* side:
-- Reads real demand signal directly from the audit trail (`SELECT
-  item_ids FROM transactions WHERE status = 'auto_approved'`, counted per
-  category over the last 20 transactions) — no fabricated data.
-- Decides bounded promotions via a deterministic rule (not an LLM): a
-  category needs ≥3 recent purchases to be "trending", and the discount
-  scales with demand but is hard-capped at 10% — this makes the "bounded"
-  claim easy to defend, since there's no LLM-hallucination risk in the
-  discount math itself.
-- Publishes decisions to a shared file (`active_promotions.json`) — a
-  deliberately simple communication mechanism between the two agents,
-  rather than a complex message-passing protocol.
-
-**Buyer-agent integration**: `reasoning_engine.py` now checks
-`get_active_promotions()` before reasoning, and includes any promotion
-relevant to the candidate categories in its LLM prompt — the LLM is
-explicitly instructed that match-quality comes first and a promotion must
-never cause it to pick a worse-fitting candidate.
-
-**Verified end-to-end**: a "watch" query correctly showed
-`active_promotions_seen: {}` (a "Shirts" promotion was active but
-correctly filtered out as irrelevant to watches), while a "shirt" query
-correctly surfaced and mentioned the active discount — confirming the
-category-filtering is genuinely selective, not a blanket application.
-
-### Phase 8 — Second Agent (Merchant-Side) Complete ✅
-
-Closed the loop so the two agents interact **fully autonomously**, with
-no manual script-running required:
-- `merchant_agent.py`'s own decisions (new/changed/removed promotions)
-  are now also logged to the shared audit trail
-  (`decision_type: "merchant_promotion"`), only for categories where the
-  promotion actually *changed* — avoiding redundant no-op log spam.
-- `policy_engine.py` automatically calls `run_merchant_agent()` after
-  every `auto_approved` transaction — the merchant-agent re-evaluates
-  demand and updates its promotions in the same run, without any human
-  intervention.
-
-**Verified in a single run**: one `policy_engine.py` execution showed the
-buyer-agent consuming an existing 6% "Shirts" promotion in its reasoning,
-completing a purchase, and then — automatically, in the same run — the
-merchant-agent recalculating demand (now 6 purchases) and updating the
-promotion to 8%, all traceable in one `session_id`'s audit history. This
-is a genuine, verified multi-agent interaction loop: two independently-
-reasoning agents, coupled only through a shared auditable signal, not a
-hardcoded call between them.
-
-**Demo note**: the bandit algorithm (Phase 6) will be described in the
-pitch/Q&A rather than shown live (it only meaningfully activates after
-5+ real purchases per category, which the demo won't organically
-generate). The merchant-agent loop, by contrast, **is** demo-able live,
-since its threshold (3 purchases) is achievable within a short live demo.
+- **Explainable** — every decision the buyer-agent or merchant-agent makes is logged with a plain-language reasoning string, not just a status code. Visible in both a customer-facing Audit Trail and a Merchant Dashboard.
+- **Bounded** — a policy file enforces a max spend per transaction, a max upsell-addon percentage, a daily agent spend cap, and per-category price restrictions. The agent cannot exceed these regardless of what it decides it wants to buy.
+- **Gated** — any order above a configurable approval threshold pauses and requires explicit human approval before a payment is ever charged. Autonomy has a hard ceiling.
+- **Fails gracefully** — the agent will honestly return "no genuine match found" rather than force a bad purchase, and an over-budget order degrades to a pending-approval state instead of silently overspending.
 
 ---
 
-## Purchase Architecture: Two Modes
+## Core Features
 
-*(unchanged — see Mode 1: Fully Autonomous and Mode 2: Human-Browse,
-Agent-Executes in the previous version)*
+### Shopping Modes
+- **Autonomous Mode** — describe what you want in plain language; the agent searches, decides, and completes the purchase end-to-end. Optional "Complete the Look" builds a full outfit within a stated add-ons budget.
+- **Browse Mode** — search as many times as you like, review the agent's recommendations side by side, build a cart across multiple searches, and checkout once.
 
----
+### Buyer-Agent Pipeline
+- **Hybrid search** over the product catalog to retrieve relevant candidates — a genuinely agent-readable catalog layer, not a page meant only for human browsing.
+- **LLM-based reasoning** that separates *hard constraints* (category, stated color, stated brand) from *soft preferences* (comfortable, stylish, professional) — rejecting a candidate only on a real violation, never on an assumption the user never actually stated.
+- **True Upsell** — suggests a same-category upgrade only when it's a meaningfully better product, not just a pricier one.
+- **Complete the Look** — suggests at most one complementary item per outfit slot (topwear, footwear, accessory, etc.), ranked by priority, respecting the customer's stated budget.
+- **Similar Items** — surfaces genuinely different same-category alternatives (never near-duplicates) at a comparable price point.
+- **Cart-value nudge** — a lightweight, LLM-free calculation that only nudges toward a free-delivery threshold when the remaining gap is realistically closeable.
+- **LinUCB contextual bandit** — refines final product selection within a category once that category has accumulated enough real purchase history to have a genuinely learned preference, avoiding cold-start noise.
 
-## Known Limitations / Scoping Decisions
+### Merchant-Agent — independent revenue growth
+- Runs automatically after every completed transaction, monitoring recent purchase volume per category and adjusting promotional discounts in response to real demand trends.
+- Fully independent from the buyer-agent's own decision process — the two coordinate only through a shared, auditable signal (the buyer-agent reads and reasons over live promotions when deciding what to recommend), not a hardcoded coupling between them.
+- Live and visible in the Merchant Dashboard's Promotions tab, with the reasoning behind every adjustment.
 
-*(unchanged, plus:)*
-- **The bandit only refines main-product selection**, not the three
-  revenue-add-on mechanisms — a deliberate scoping decision (see Phase 6),
-  not an oversight.
-- **The merchant-agent's demand signal is simple recency-based counting**,
-  not sophisticated time-series forecasting — appropriate for buildathon
-  scope; a production system would likely use more advanced trend-detection.
-- **Merchant-agent promotions apply store-wide** (any customer sees the
-  same active discount for a trending category) — no per-customer
-  personalization, which is out of scope here.
+### Trust & Safety
+- **Spend-based approval gate** (configurable threshold) — orders above it require explicit human approval before payment.
+- **Full audit trail** — every decision, transaction, and promotion update logged with reasoning, timestamps, and session grouping.
+- **Code-level safety nets on top of every LLM decision** — e.g. verifying an LLM-suggested product ID actually exists among valid candidates, enforcing "one item per outfit slot" in code even if the model's own reasoning slips, capping suggestion counts, validating price sanity before ever showing a suggestion to a customer.
 
----
+### Payments
+- Real Razorpay Checkout integration (test mode) — order creation, payment-signature verification, capture.
 
-## Setup Instructions
-
-### 1. Razorpay Test Account
-Sign up at https://dashboard.razorpay.com, switch to **Test Mode**,
-generate API keys under **Settings → API Keys**, add to `.env`.
-
-### 2. Backend Setup
-```bash
-cd backend
-python -m venv venv
-venv\Scripts\activate      # on Mac/Linux: source venv/bin/activate
-pip install -r requirements.txt
-copy .env.example .env     # on Mac/Linux: cp .env.example .env
-# fill in RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, MISTRAL_API_KEY in .env
-```
-
-### 3. Generate the Catalog + Build Search Index
-```bash
-python scripts/generate_catalog.py
-python ../catalog-service/build_embeddings.py
-```
-
-### 4. Run the Full System (Buyer-Agent + Policy + Razorpay + Bandit + Audit + Merchant-Agent)
-```bash
-python ../buyer-agent/policy_engine.py
-```
-A single run: selects a product, checks/applies bounded revenue
-mechanisms, creates a real Razorpay order if auto-approved, feeds the
-bandit, logs everything to the audit trail, and triggers the
-merchant-agent's demand re-evaluation — all in one autonomous flow.
-
-To complete an actual test payment, open `buyer-agent/test_checkout.html`
-with the printed `razorpay_order_id` / `razorpay_key_id`, and pay with
-Razorpay's India test card: **4100 2800 0000 1007**, any future expiry,
-any CVV.
-
-### 5. Inspect the Audit Trail Directly
-```bash
-python ../audit-service/audit_db.py
-```
-
-### 6. Run the Merchant-Agent Standalone (Optional — normally auto-triggered)
-```bash
-python ../merchant-agent/merchant_agent.py
-```
-
-### 7. Frontend Setup (Phase 10, not needed yet)
-```bash
-cd frontend
-npm create vite@latest . -- --template react
-npm install
-npm install -D tailwindcss postcss autoprefixer
-```
+### Two Dashboards
+- **Customer Audit Trail** — a customer's view of what the agent decided and why.
+- **Merchant Dashboard** — overview stats, live active promotions, and the full decision audit trail, behind a separate merchant login.
 
 ---
 
-## Catalog Source
+## Tech Stack
 
-*(unchanged — real Myntra dataset, 897 products, 53 categories,
-gender-aware complementary mapping, synthetic ratings for 147 products
-disclosed for transparency.)*
+**Backend**
+- FastAPI (Python) — REST API
+- SQLite — auth (users/sessions), audit trail (decisions/transactions)
+- Groq API (`openai/gpt-oss-120b` / `openai/gpt-oss-20b`) — structured tool-calling for product selection, upsell, complete-the-look, and similar-items decisions
+- Razorpay Python SDK (test mode) — order creation and payment verification
+- bcrypt — password hashing
+
+**Frontend**
+- React + Vite
+- React Router
+- Tailwind CSS
+- Razorpay Checkout.js — browser-side payment UI
 
 ---
 
 ## Project Structure
-agentic-commerce/
-├── backend/
-│ ├── data/
-│ │ ├── catalog.json
-│ │ ├── policy.json
-│ │ ├── faiss_index.bin
-│ │ ├── faiss_id_map.json
-│ │ ├── bandit_state.json # LinUCB learned state (Phase 6)
-│ │ ├── audit.db # SQLite audit trail (Phase 7)
-│ │ └── active_promotions.json # merchant-agent's published promotions (Phase 7/8)
-│ ├── scripts/generate_catalog.py
-│ ├── main.py
-│ ├── requirements.txt
-│ └── .env.example
-├── catalog-service/
-│ ├── build_embeddings.py
-│ ├── bm25_search.py
-│ ├── query_parser.py
-│ └── hybrid_search.py
+
+Agentic Commerce/
+├── Backend/
+│ ├── main.py # FastAPI app — all HTTP endpoints
+│ ├── auth.py # User signup/login/session management
+│ └── data/
+│ ├── catalog.json # Product catalog
+│ ├── policy.json # Spend limits, approval threshold, cart incentives
+│ └── users.db # SQLite (gitignored)
+│
 ├── buyer-agent/
-│ ├── reasoning_engine.py # core selection + bandit + promotion-awareness
+│ ├── reasoning_engine.py # Core product-selection reasoning (BuyerAgent)
+│ ├── policy_engine.py # Orchestrates the full order pipeline + approval gate
+│ ├── upsell_true.py # "True upsell" upgrade suggestions
+│ ├── complete_the_look.py # Multi-item complementary suggestions
+│ ├── similar_items.py # Same-category alternatives
+│ ├── cart_nudge.py # Free-delivery threshold nudge
 │ ├── bandit.py # LinUCB contextual bandit
-│ ├── upsell_true.py
-│ ├── complete_the_look.py
-│ ├── similar_items.py
-│ ├── cart_nudge.py
-│ ├── policy_engine.py # orchestrates everything + Razorpay + audit + merchant-agent trigger
-│ ├── razorpay_client.py
-│ └── test_checkout.html
-├── merchant-agent/
-│ └── merchant_agent.py # SECOND agent — demand-detection + bounded promotions (Phase 7/8)
+│ └── razorpay_client.py # Razorpay order/payment integration
+│
+├── catalog-service/
+│ └── hybrid_search.py # Product retrieval — agent-readable catalog layer
+│
 ├── audit-service/
-│ └── audit_db.py # SQLite schema + logging functions (Phase 7)
-└── frontend/ # React UI (Phase 10)
+│ └── audit_db.py # Decision + transaction logging
+│
+├── merchant-agent/
+│ └── merchant_agent.py # Independent revenue/promotion-adjustment agent
+│
+└── Frontend/
+├── public/ # Images, videos, background assets
+└── src/
+├── pages/
+│ ├── Landing.jsx
+│ ├── Login.jsx / Signup.jsx
+│ ├── ModeSelection.jsx
+│ ├── Shop.jsx # Autonomous + Browse shopping UI
+│ ├── AuditDashboard.jsx # Customer-facing audit trail
+│ ├── MerchantLogin.jsx
+│ └── MerchantDashboard.jsx # Merchant overview + promotions + audit
+├── components/
+│ ├── ProtectedRoute.jsx
+│ └── MerchantProtectedRoute.jsx
+├── api/auth.js
+└── App.jsx
 
 
-## Policy Summary (data/policy.json)
-- Max spend per transaction: ₹20,000 (merchant-side bound)
-- Approval gate triggers above: ₹10,000
-- Free-delivery cart-nudge threshold: ₹1,999
-- Bandit minimum-observations-to-override: 5 per category
-- Merchant-agent: max discount 10%, trending-threshold 3 purchases per 20-transaction window
+---
 
-## Next Steps (Phase 9)
-- Build 5 distinct failure scenarios: payment timeout, stock-out
-  (race-condition), policy violation, API rate-limit, and
-  prompt-injection resistance
-- Each with its own graceful recovery flow (retry/rollback/notify/escalate)
-- All failures logged to the same audit trail with full reasoning
+## Setup
+
+### Prerequisites
+- Python 3.10+
+- Node.js 18+
+- A [Groq API key](https://console.groq.com/keys) (free tier)
+- A [Razorpay](https://razorpay.com) test-mode account (Key ID + Key Secret)
+
+### Backend
+
+```bash
+cd Backend
+python -m venv ../venv
+../venv/Scripts/activate      # Windows
+# source ../venv/bin/activate  # macOS/Linux
+
+pip install -r requirements.txt
+```
+
+Create a `.env` file in `Backend/`:
+
+GROQ_API_KEY=your_groq_key_here
+RAZORPAY_KEY_ID=your_razorpay_key_id
+RAZORPAY_KEY_SECRET=your_razorpay_key_secret
+
+
+Run the backend:
+```bash
+python main.py
+```
+API available at `http://localhost:8000`.
+
+### Frontend
+
+```bash
+cd Frontend
+npm install
+npm run dev
+```
+App available at `http://localhost:5173`.
+
+---
+
+## Usage
+
+1. **Customers**: sign up at `/signup`, choose Autonomous or Browse mode, and start shopping.
+2. **Merchant**: navigate to `/merchant-login` (linked from the landing page nav) — single shared password, since this represents one merchant managing their own catalog.
+3. **Audit trail**: accessible from the shop page (`AUDIT` in the nav) for customers, and as a full tab in the Merchant Dashboard.
+
+---
+
+## Configuration
+
+Spend limits, the approval-gate threshold, and cart-incentive rules are all controlled from `Backend/data/policy.json` — no code changes needed to adjust:
+- `approval_gate.approval_required_above` — orders above this amount require manual approval.
+- `spend_limits.max_spend_per_transaction`, `daily_agent_spend_cap`, `max_upsell_addon_percentage`
+- `category_restrictions.restricted_categories` — per-category price caps
+- `cart_incentives.free_delivery_threshold`, `nudge_trigger_max_gap_percentage`
+
+---
+
+## A quick walkthrough to see the full loop
+
+1. Run an Autonomous-mode search **under** the approval threshold — watch it complete end-to-end, then open the Audit Trail to see the exact reasoning behind the pick.
+2. Run one **over** the threshold — it pauses and asks for approval instead of charging automatically.
+3. Run a deliberately unmatchable query — it returns an honest "no genuine match found" instead of forcing a purchase.
+4. Open the Merchant Dashboard's Promotions tab — see a live, demand-reactive discount the merchant-agent set on its own, with the reasoning behind it.
+
+---
+
+## Author
+
+**Mihir Yadav**
+- LinkedIn: [linkedin.com/in/mihir-yadav-4509aa315](https://www.linkedin.com/in/mihir-yadav-4509aa315/)
+- GitHub: [github.com/MihirYadav619/Agentic-Commerce](https://github.com/MihirYadav619/Agentic-Commerce)
+
+---
+
+## License
+
+This project is provided as-is for educational and portfolio purposes.
